@@ -1,0 +1,12 @@
+# 个人配置和数据：包含密码、推送 token、持仓，永远不要提交
+config.json
+data/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 系统
+.DS_Store

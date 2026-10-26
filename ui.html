@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>纪律机器人</title>
+<style>
+  :root {
+    --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea;
+    --red: #d70015; --red-bg: #fff0f0; --orange: #c75300; --orange-bg: #fff6e8;
+    --green: #1a7f37; --green-bg: #eefaf1; --blue: #0066cc;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000; --card: #1c1c1e; --text: #f5f5f7; --muted: #98989d; --line: #38383a;
+      --red: #ff453a; --red-bg: #3a1517; --orange: #ff9f0a; --orange-bg: #3a2a10;
+      --green: #30d158; --green-bg: #12301a; --blue: #0a84ff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 60px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  h1 { font-size: 22px; margin: 0; }
+  h2 { font-size: 15px; margin: 0 0 12px; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 99px; background: var(--orange-bg); color: var(--orange); }
+  .muted { color: var(--muted); }
+  .clock { margin-left: auto; font-variant-numeric: tabular-nums; }
+  .card { background: var(--card); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  th { font-weight: 500; color: var(--muted); font-size: 12px; }
+  td.num { font-variant-numeric: tabular-nums; }
+  .badge { padding: 2px 8px; border-radius: 6px; font-size: 12px; white-space: nowrap; }
+  .s-持有 { background: var(--green-bg); color: var(--green); }
+  .s-观察期 { background: var(--orange-bg); color: var(--orange); }
+  .s-待卖出 { background: var(--red-bg); color: var(--red); font-weight: 600; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--card); color: var(--text);
+           padding: 5px 12px; border-radius: 8px; cursor: pointer; }
+  button:hover { border-color: var(--blue); }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.danger { background: var(--red); border-color: var(--red); color: #fff; }
+  input { font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px;
+          background: var(--bg); color: var(--text); width: 130px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } .clock { margin-left: 0; } }
+  .platform { display: flex; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--line);
+              border-radius: 8px; margin-top: 6px; cursor: pointer; }
+  .platform:has(input:checked) { border-color: var(--blue); }
+  .platform input { width: auto; }
+  .list { max-height: 320px; overflow: auto; }
+  .item { padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .item:last-child { border-bottom: 0; }
+  .item pre { margin: 4px 0 0; white-space: pre-wrap; font: inherit; color: var(--muted); }
+  .lv-critical b { color: var(--red); } .lv-warn b { color: var(--orange); }
+  #alarm { display: none; background: var(--red); color: #fff; border-radius: 12px; padding: 18px 20px; margin-bottom: 16px;
+           animation: pulse 1.2s infinite; }
+  #alarm h2 { font-size: 20px; margin: 0 0 6px; }
+  #alarm button { background: #fff; color: var(--red); border: 0; font-weight: 600; margin-top: 8px; }
+  @keyframes pulse { 50% { opacity: .82; } }
+  .r-等待回落 { background: var(--line); color: var(--muted); }
+  .r-回补区 { background: #e8f1ff; color: var(--blue); }
+  .r-可买回 { background: var(--green-bg); color: var(--green); font-weight: 600; }
+  .r-支撑失效 { background: var(--red-bg); color: var(--red); }
+  @media (prefers-color-scheme: dark) { .r-回补区 { background: #0d2a4a; } }
+  #ready { display: none; background: var(--green-bg); color: var(--green); border-radius: 12px;
+           padding: 14px 18px; margin-bottom: 16px; }
+  #report { white-space: pre-wrap; font: inherit; margin: 12px 0 0; }
+  .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
+           padding: 10px 16px; border-radius: 10px; max-width: 90vw; display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>纪律机器人</h1>
+    <span class="pill">模拟运行 · 自动下单未启用</span>
+    <span class="clock muted" id="clock"></span>
+  </header>
+
+  <div id="alarm"></div>
+  <div id="ready"></div>
+
+  <section class="card">
+    <h2>持仓</h2>
+    <table>
+      <thead><tr><th>股票</th><th>支撑位</th><th>级别</th><th>状态</th><th>最近价</th><th>回补计划</th><th></th></tr></thead>
+      <tbody id="holdings"></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">收盘简报 <span class="muted" id="briefWhen" style="font-weight:400"></span></h2>
+      <button onclick="runJob('briefing','生成简报')">立即生成</button>
+    </div>
+    <pre id="briefing" class="muted" style="white-space:pre-wrap;font:inherit;margin:12px 0 0;max-height:420px;overflow:auto">还没有简报。交易日收盘检查完成后自动生成。</pre>
+  </section>
+
+  <section class="card">
+    <h2>建仓 · 锁定支撑位</h2>
+    <div class="row">
+      <input id="code" placeholder="股票代码，如 000333" maxlength="6">
+      <button onclick="findPlatforms()">找平台</button>
+      <span class="muted">或手动</span>
+      <input id="manual" placeholder="支撑位价格">
+      <input id="shares" placeholder="股数（可不填）" style="width:120px">
+      <button onclick="addManual()">手动锁定</button>
+    </div>
+    <div id="platforms"></div>
+  </section>
+
+  <section class="card" id="rebuyCard" style="display:none">
+    <h2>减仓后 · 锁定回补价</h2>
+    <div id="rebuyBody"></div>
+  </section>
+
+  <div class="grid">
+    <section class="card">
+      <h2>提醒记录</h2>
+      <div class="list" id="alerts"></div>
+    </section>
+    <section class="card">
+      <h2>纪律日志</h2>
+      <div class="list" id="events"></div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>工具</h2>
+    <div class="row">
+      <button onclick="post('/api/test-alert').then(()=>toast('已发出测试强提醒'))">测试强提醒</button>
+      <button onclick="runJob('intraday','观察日检查')">立即做观察日检查</button>
+      <button onclick="runJob('close','收盘检查')">立即做收盘检查</button>
+      <button onclick="showReport()">本月纪律报告</button>
+    </div>
+    <p class="muted">自动时间（北京时间，交易日）：14:40 观察日检查 → 14:40–14:57 每 3 分钟催卖 → 15:30 收盘检查 → 收盘简报。
+      <span id="sched"></span></p>
+    <pre id="report"></pre>
+  </section>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let found = null, alarmOn = false, audioCtx = null;
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error);
+  return j;
+}
+const post = (url, body) => api(url, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                      body: JSON.stringify(body || {})});
+function toast(msg, ms = 3500) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(t._h); t._h = setTimeout(() => t.style.display = 'none', ms);
+}
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function beep() {
+  try {
+    audioCtx = audioCtx || new AudioContext();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.frequency.value = 880; o.connect(g); g.connect(audioCtx.destination);
+    g.gain.setValueAtTime(0.2, audioCtx.currentTime); o.start(); o.stop(audioCtx.currentTime + 0.4);
+  } catch (e) {}
+}
+
+async function refresh() {
+  let s;
+  try { s = await api('/api/state'); } catch (e) { $('clock').textContent = '⚠️ 连不上机器人，它可能已经关了'; return; }
+  $('clock').textContent = `北京时间 ${s.now}` + (s.trading_day === false ? ' · 今天休市' : '');
+  $('sched').textContent = s.scheduler.length ? `最近：${s.scheduler[0]}` : '';
+  if (s.briefing) {
+    $('briefing').textContent = s.briefing.text; $('briefing').classList.remove('muted');
+    $('briefWhen').textContent = `${s.briefing.date} ${s.briefing.time}`;
+  }
+
+  $('holdings').innerHTML = s.holdings.map(h => `
+    <tr>
+      <td>${esc(h.name)} <span class="muted">${h.code}</span>${h.shares ? `<div class="muted">${h.shares} 股</div>` : ''}</td>
+      <td class="num">${h.support}</td>
+      <td style="white-space:nowrap">${esc(h.level)}</td>
+      <td><span class="badge s-${h.status}">${h.status}</span>
+          ${h.status === '观察期' ? `<span class="muted">${h.watch_date} 跌破${h.heavy ? '（放量）' : ''}</span>` : ''}
+          ${h.status === '待卖出' ? `<span class="muted">信号价 ${h.sell_price}</span>` : ''}</td>
+      <td class="num">${h.last_price ?? '-'} <span class="muted">${esc(h.last_check || '')}</span></td>
+      <td>${h.rebuy ? `<span class="num">${h.rebuy.support}</span>
+          <span class="badge r-${h.rebuy.status}">${h.rebuy.status}${h.rebuy.status === '回补区' ? ` 第${h.rebuy.days}天` : ''}</span>
+          <div class="muted">减仓价 ${h.rebuy.sell_price}</div>` : '<span class="muted">-</span>'}</td>
+      <td><div class="row">
+        ${h.status === '持有' ? `<button onclick="raiseSupport('${h.code}', ${h.support})">上移支撑</button>` : ''}
+        ${h.status !== '待卖出' && !h.rebuy ? `<button onclick="trim('${h.code}')">减仓</button>` : ''}
+        ${h.rebuy ? `<button class="${h.rebuy.status === '可买回' ? 'primary' : ''}" onclick="rebought('${h.code}')">已买回</button>
+          <button onclick="lowerRebuy('${h.code}', ${h.rebuy.support}, ${h.rebuy.sell_price})">下调回补价</button>
+          <button onclick="cancelRebuy('${h.code}')">取消回补</button>` : ''}
+        <button class="${h.status === '待卖出' ? 'danger' : ''}" onclick="sold('${h.code}')">已清仓</button>
+      </div></td>
+    </tr>`).join('') || '<tr><td colspan="7" class="muted">暂无持仓，先在下面建仓。</td></tr>';
+
+  const ready = s.holdings.filter(h => h.rebuy && h.rebuy.status === '可买回');
+  $('ready').style.display = ready.length ? 'block' : 'none';
+  $('ready').innerHTML = ready.map(h =>
+    `<b>🟢 可以买回 ${esc(h.name)}（${h.code}）</b>：回补价 ${h.rebuy.support} 已连续 ${h.rebuy.days} 天站稳。买回后点「已买回」。`).join('<br>');
+
+  const pending = s.holdings.filter(h => h.status === '待卖出');
+  alarmOn = pending.length > 0;
+  $('alarm').style.display = alarmOn ? 'block' : 'none';
+  $('alarm').innerHTML = pending.map(h => `
+    <h2>🔴 立即清仓 ${esc(h.name)}（${h.code}）</h2>
+    <div>${h.sell_date} 触发清仓信号，信号价 ${h.sell_price}，支撑位 ${h.support}。按规则必须卖，不许再等。</div>
+    <button onclick="sold('${h.code}')">我已经卖了 → 记录成交价</button>`).join('<hr>');
+  document.title = alarmOn ? '🔴 立即清仓！' : '纪律机器人';
+
+  $('alerts').innerHTML = s.alerts.map(a => `
+    <div class="item lv-${a.level}"><b>${esc(a.title)}</b> <span class="muted">${a.time}</span><pre>${esc(a.body)}</pre></div>`
+  ).join('') || '<div class="muted">还没有提醒</div>';
+
+  $('events').innerHTML = s.events.map(e => {
+    const info = e.note || e.reason || (e.rebuy_support !== undefined ? `回补价 ${e.rebuy_support}` : '') ||
+                 (e.sell_price !== undefined ? `减仓价 ${e.sell_price} → 回补价 ${e.support}` : '') ||
+                 (e.close !== undefined && e.kind.startsWith('回补') ? `收盘 ${e.close} / 回补价 ${e.support}` : '') ||
+                 (e.support !== undefined ? `支撑 ${e.support}` : '') ||
+                 (e.new !== undefined ? `${e.old} → ${e.new}` : '') || (e.price !== undefined ? `价 ${e.price}` : '');
+    return `<div class="item"><b style="color:${e.kind === '违规' ? 'var(--red)' : 'inherit'}">${e.kind}</b>
+      ${e.code} <span class="muted">${e.time}</span><pre>${esc(info)}</pre></div>`;
+  }).join('') || '<div class="muted">还没有记录</div>';
+}
+
+async function findPlatforms() {
+  const code = $('code').value.trim();
+  $('platforms').innerHTML = '<p class="muted">查找中…</p>';
+  try {
+    found = await post('/api/platforms', {code});
+    $('platforms').innerHTML = `<p>${esc(found.name)}（${found.code}）最新收盘 <b>${found.price}</b>（${found.date}）</p>` +
+      (found.platforms.length ? found.platforms.map((p, i) => `
+        <label class="platform"><input type="radio" name="pf" value="${i}" ${i === 0 ? 'checked' : ''}>
+          <span><b>${p.level}</b> ${p.start} ~ ${p.end}，${p.days} 天，区间 ${p.low}–${p.high}</span>
+          <span style="margin-left:auto">支撑位 <b>${p.support}</b></span></label>`).join('') +
+        '<p><button class="primary" onclick="addPicked()">锁定选中的支撑位</button></p>'
+      : '<p class="muted">现价下方没找到 ≥3 天、振幅 ≤10% 的横盘平台，请手动输入支撑位。</p>');
+  } catch (e) { $('platforms').innerHTML = ''; toast(e.message); }
+}
+
+const LOCK_WARN = '锁定后只能上移，不能下移。\n收盘跌破 → 观察一天 → 14:40 没有有效收回就清仓。\n\n确定锁定？';
+
+async function lock(code, support, level, platform) {
+  if (!confirm(`${code} 支撑位 ${support}\n\n${LOCK_WARN}`)) return;
+  try {
+    await post('/api/add', {code, support, level, platform, shares: $('shares').value});
+    toast('已锁定'); $('platforms').innerHTML = ''; $('code').value = ''; $('manual').value = ''; $('shares').value = ''; refresh();
+  } catch (e) { toast(e.message); }
+}
+function addPicked() {
+  const p = found.platforms[document.querySelector('input[name=pf]:checked').value];
+  lock(found.code, p.support, p.level, `${p.start}~${p.end}(${p.days}天)`);
+}
+function addManual() {
+  const code = $('code').value.trim(), support = parseFloat($('manual').value);
+  if (!code || !support) return toast('先填股票代码和支撑位');
+  lock(code, support, '手动', null);
+}
+
+async function raiseSupport(code, current) {
+  const v = prompt(`当前支撑位 ${current}，上移到多少？（只能比现在高）`);
+  if (!v) return;
+  try { await post('/api/raise', {code, price: parseFloat(v)}); toast('已上移'); }
+  catch (e) { toast(e.message, 6000); }
+  refresh();
+}
+
+async function sold(code) {
+  const v = prompt(`${code} 卖出成交价是多少？（不记得可以留空）`);
+  if (v === null) return;
+  try { const r = await post('/api/sold', {code, price: v}); toast(r.message, 6000); }
+  catch (e) { toast(e.message); }
+  refresh();
+}
+
+function renderRebuyPicker(code, name, sellPrice, platforms, lowering) {
+  window._rb = {code, sellPrice, platforms, lowering};
+  $('rebuyCard').style.display = 'block';
+  $('rebuyBody').innerHTML = `<p>${esc(name || code)}（${code}）减仓价 <b>${sellPrice}</b>。
+      回落到回补价上方 3% 以内、连续 3 天收盘不破，就提醒你买回。回补价锁定后<b>只能下调</b>。</p>` +
+    (platforms.length ? platforms.map((p, i) => `
+      <label class="platform"><input type="radio" name="rb" value="${i}" ${i === 0 ? 'checked' : ''}>
+        <span><b>${p.level}</b> ${p.start} ~ ${p.end}，${p.days} 天，区间 ${p.low}–${p.high}</span>
+        <span style="margin-left:auto">回补价 <b>${p.support}</b></span></label>`).join('') +
+      '<p class="row"><button class="primary" onclick="lockRebuyPicked()">锁定选中的回补价</button>' : '<p class="muted">下方没找到横盘平台。</p><p class="row">') +
+    `<input id="rbManual" placeholder="或手动输入回补价"><button onclick="lockRebuyManual()">手动锁定</button>
+     <button onclick="$('rebuyCard').style.display='none'">先不设</button></p>`;
+  $('rebuyCard').scrollIntoView({behavior: 'smooth'});
+}
+
+async function lockRebuy(support, level, platform) {
+  const rb = window._rb;
+  if (!confirm(`${rb.code} 回补价 ${support}\n\n锁定后只能下调，不能上调。确定？`)) return;
+  try {
+    if (rb.lowering) await post('/api/rebuy-lower', {code: rb.code, price: support});
+    else await post('/api/rebuy-plan', {code: rb.code, support, sell_price: rb.sellPrice, level, platform});
+    toast('回补价已锁定'); $('rebuyCard').style.display = 'none'; refresh();
+  } catch (e) { toast(e.message, 6000); }
+}
+function lockRebuyPicked() {
+  const p = window._rb.platforms[document.querySelector('input[name=rb]:checked').value];
+  lockRebuy(p.support, p.level, `${p.start}~${p.end}(${p.days}天)`);
+}
+function lockRebuyManual() {
+  const v = parseFloat($('rbManual').value);
+  if (!v) return toast('先填回补价');
+  lockRebuy(v, '手动', null);
+}
+
+async function trim(code) {
+  const v = prompt(`${code} 减仓（止盈卖出一部分），成交价是多少？\n剩下的仓位继续受止损纪律管。`);
+  if (!v) return;
+  const qty = prompt('减了多少股？（可留空）') || '';
+  try {
+    const r = await post('/api/trim', {code, price: parseFloat(v), qty});
+    renderRebuyPicker(r.code, r.name, r.sell_price, r.platforms, false);
+  } catch (e) { toast(e.message, 6000); }
+  refresh();
+}
+
+async function lowerRebuy(code, current, sellPrice) {
+  try {
+    const r = await post('/api/rebuy-candidates', {code, below: current});
+    renderRebuyPicker(code, '', sellPrice, r.platforms, true);
+  } catch (e) { toast(e.message); }
+}
+
+async function cancelRebuy(code) {
+  if (!confirm(`取消 ${code} 的回补计划？`)) return;
+  try { await post('/api/rebuy-cancel', {code}); toast('已取消'); } catch (e) { toast(e.message); }
+  refresh();
+}
+
+async function rebought(code) {
+  const v = prompt(`${code} 买回成交价是多少？（不记得可以留空）`);
+  if (v === null) return;
+  const qty = prompt('买回多少股？（可留空）') || '';
+  try { const r = await post('/api/rebuy', {code, price: v, qty}); toast(r.message, 7000); }
+  catch (e) { toast(e.message); }
+  refresh();
+}
+
+async function runJob(job, label) {
+  toast(`${label}中…`);
+  try { await post(`/api/run/${job}`); toast(`${label}完成`); } catch (e) { toast(e.message); }
+  refresh();
+}
+
+async function showReport() {
+  try { $('report').textContent = (await api('/api/report')).text; } catch (e) { toast(e.message); }
+}
+
+refresh();
+setInterval(refresh, 10000);
+setInterval(() => { if (alarmOn) beep(); }, 5000);
+</script>
+</body>
+</html>

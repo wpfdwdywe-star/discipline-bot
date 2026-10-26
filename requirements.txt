@@ -1,0 +1,6 @@
+# 测试通过的版本。AKShare 依赖的数据网站经常改版，遇到取数报错先试试升级：pip install -U akshare
+akshare>=1.19.3
+pandas>=2.2
+requests>=2.31
+flask>=3.0
+pytest>=8.0
