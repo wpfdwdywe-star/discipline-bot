@@ -146,7 +146,7 @@ def check_rebuy(status: str, days: int, close: float, support: float) -> RebuySt
 
 
 # ---- 盘中监控（交易时段每 5 分钟） ----
-# 上午走势权重低（多是开盘情绪），严重门槛更高；一般情况上午攒到 13:00 再发
+# 上午走势权重低（多是开盘情绪），严重门槛更高；一般情况上午攒到 11:31 收盘后再发
 DEEP_BREAK = {"morning": 0.05, "afternoon": 0.03}   # 盘中跌破止损位超过这个比例 = 严重
 BIG_DROP = {"morning": 9.0, "afternoon": 7.0}       # 单日跌幅超过这个 = 严重
 DROP = 5.0                                           # 跌 5% 以上（未到严重）= 一般

@@ -11,10 +11,24 @@ import akshare as ak
 import pandas as pd
 import requests
 
+# AKShare 内部的请求大多没设超时，服务器不回数据时会一直挂着，把调度线程卡死（10-27 同花顺财报接口卡住，收盘简报没发）。
+# 没指定超时的请求一律补上默认超时，超时抛异常走重试/降级。
+REQUEST_TIMEOUT = 20
+_session_request = requests.Session.request
+
+
+def _request_with_timeout(self, method, url, **kw):
+    if kw.get("timeout") is None:
+        kw["timeout"] = REQUEST_TIMEOUT
+    return _session_request(self, method, url, **kw)
+
+
+requests.Session.request = _request_with_timeout
+
 TZ = ZoneInfo("Asia/Shanghai")
 CALENDAR_CACHE = Path(os.environ.get("DISCIPLINE_DATA") or Path(__file__).parent / "data") / "trade_calendar.json"
 
-# 系统时钟和网络时间的差（秒）。休眠恢复后系统时钟可能不准，又没有 NTP，用 HTTP Date 头校正。
+# 系统时钟要额外加的校正（秒）。平时是 0；只有系统时钟持续不准时，调度器才会设它（见 core.Scheduler._clock_ok）。
 _clock_offset = 0.0
 
 
@@ -22,18 +36,20 @@ def now() -> dt.datetime:
     return dt.datetime.now(TZ) + dt.timedelta(seconds=_clock_offset)
 
 
-def sync_clock() -> float:
-    """用新浪服务器的 Date 头校时，返回校正量（秒）。失败时保持原样。"""
-    global _clock_offset
-    try:
-        before = time.time()
-        r = requests.head("https://hq.sinajs.cn", timeout=5)
-        server = email.utils.parsedate_to_datetime(r.headers["Date"]).timestamp()
-        offset = server - (before + time.time()) / 2
-        _clock_offset = offset if abs(offset) > 5 else 0.0
-    except Exception:
-        pass
-    return _clock_offset
+def clock_skew() -> float | None:
+    """网络时间 − 系统时钟（秒），只测量、不改任何状态。拿不到网络时间返回 None。
+
+    休眠的机器刚被唤醒时，系统时钟会停在暂停那一刻，过几秒才被平台校准；这时测出来的差会很大。
+    """
+    for url in ("https://www.baidu.com", "https://hq.sinajs.cn"):
+        try:
+            before = time.time()
+            r = requests.head(url, timeout=5)
+            server = email.utils.parsedate_to_datetime(r.headers["Date"]).timestamp()
+            return server - (before + time.time()) / 2
+        except Exception:
+            continue
+    return None
 
 
 def today() -> str:
@@ -73,7 +89,36 @@ def daily_bars(code: str, days: int = 200) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     df = df[["date", "open", "high", "low", "close", "volume", "amount"]]
     df[["open", "high", "low", "close", "volume", "amount"]] = df[["open", "high", "low", "close", "volume", "amount"]].astype(float)
-    return df.sort_values("date").tail(days).reset_index(drop=True)
+    return _with_today_bar(df.sort_values("date"), _sina_symbol(code)).tail(days).reset_index(drop=True)
+
+
+BAR_COLS = ["open", "high", "low", "close", "volume", "amount"]
+
+
+def today_bar_from_minutes(sina_symbol: str) -> dict | None:
+    """收盘后用当天分钟线合成今天的日K。新浪日K要到 16:30 左右才更新，分钟线 15:00 那根收盘后马上就有。
+
+    只有拿到完整的一天（最后一根是 15:00）才返回，盘中不合成半截K线。实测和官方日K一致。
+    """
+    d = today()
+    try:
+        m = _retry(lambda: ak.stock_zh_a_minute(symbol=sina_symbol, period="1", adjust=""))
+    except Exception:
+        return None
+    m = m[m["day"].astype(str).str.startswith(d)]
+    if m.empty or str(m["day"].iloc[-1])[11:16] < "15:00":
+        return None
+    m = m.astype({c: float for c in BAR_COLS})
+    return {"date": d, "open": m["open"].iloc[0], "high": m["high"].max(), "low": m["low"].min(),
+            "close": m["close"].iloc[-1], "volume": m["volume"].sum(), "amount": m["amount"].sum()}
+
+
+def _with_today_bar(df: pd.DataFrame, sina_symbol: str) -> pd.DataFrame:
+    """收盘后（15:01 起）日K还没有今天那根，就用分钟线补上。"""
+    if df.empty or df["date"].iloc[-1] >= today() or now().time() < dt.time(15, 1):
+        return df
+    bar = today_bar_from_minutes(sina_symbol)
+    return pd.concat([df, pd.DataFrame([bar])], ignore_index=True) if bar else df
 
 
 def exright_factor(code: str, since: str) -> float:
@@ -149,10 +194,55 @@ def financial_abstract(code: str) -> pd.DataFrame | None:
     return df
 
 
+def valuation(code: str, indicator: str) -> pd.DataFrame | None:
+    """近 5 年估值序列（百度）：indicator 为 "市盈率(TTM)" 或 "市净率"。按天缓存，拿不到返回 None。"""
+    cache = CALENDAR_CACHE.parent / "valuation" / f"{code}_{indicator}.json"
+    if cache.exists():
+        saved = json.loads(cache.read_text())
+        if saved["date"] == today():
+            return pd.DataFrame(saved["rows"])
+    try:
+        df = _retry(lambda: ak.stock_zh_valuation_baidu(symbol=code, indicator=indicator, period="近五年"))
+    except Exception:
+        return None
+    df = df[["date", "value"]].astype({"date": str, "value": float})
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"date": today(), "rows": df.to_dict("records")}, ensure_ascii=False))
+    return df
+
+
+def top10_holders(code: str) -> dict | None:
+    """前十大股东（占总股本比例）。东财优先（数据完整），新浪备用（部分持股比例会缺，合计偏小时标为不完整）。
+
+    返回 {"date", "total", "top1_name", "top1_pct", "complete"}；拿不到返回 None。
+    """
+    d = now().date()
+    quarter_ends = [f"{y}{md}" for y in (d.year, d.year - 1) for md in ("1231", "0930", "0630", "0331")]
+    for q in [q for q in quarter_ends if q <= d.strftime("%Y%m%d")][:4]:
+        try:
+            df = ak.stock_gdfx_top_10_em(symbol=_sina_symbol(code), date=q)
+        except Exception:
+            continue
+        if len(df):
+            pcts = df["占总股本持股比例"].astype(float)
+            return {"date": f"{q[:4]}-{q[4:6]}-{q[6:]}", "total": round(float(pcts.sum()), 2),
+                    "top1_name": str(df["股东名称"].iloc[0]), "top1_pct": float(pcts.iloc[0]), "complete": True}
+    try:
+        df = _retry(lambda: ak.stock_main_stock_holder(stock=code))
+    except Exception:
+        return None
+    df = df[df["截至日期"].astype(str) == df["截至日期"].astype(str).max()].head(10)
+    pcts = pd.to_numeric(df["持股比例"], errors="coerce")
+    return {"date": str(df["截至日期"].iloc[0])[:10], "total": round(float(pcts.sum()), 2),
+            "top1_name": str(df["股东名称"].iloc[0]), "top1_pct": float(pcts.iloc[0]) if pd.notna(pcts.iloc[0]) else None,
+            "complete": bool(pcts.notna().all())}
+
+
 def index_bars(symbol: str = "sh000300") -> pd.DataFrame:
     df = _retry(lambda: ak.stock_zh_index_daily(symbol=symbol))
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    return df.tail(5).reset_index(drop=True)
+    df = df.astype({c: float for c in ["open", "high", "low", "close", "volume"]})
+    return _with_today_bar(df.sort_values("date"), symbol).tail(5).reset_index(drop=True)
 
 
 def stock_name(code: str) -> str:

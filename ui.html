@@ -60,6 +60,10 @@
   #alarm h2 { font-size: 20px; margin: 0 0 6px; }
   #alarm button { background: #fff; color: var(--red); border: 0; font-weight: 600; margin-top: 8px; }
   @keyframes pulse { 50% { opacity: .82; } }
+  .v-值得考虑 { background: var(--green-bg); color: var(--green); }
+  .v-谨慎 { background: var(--orange-bg); color: var(--orange); }
+  .v-不建议 { background: var(--red-bg); color: var(--red); font-weight: 600; }
+  .report { white-space: pre-wrap; font: inherit; margin: 12px 0 0; padding: 12px; border-radius: 8px; background: var(--bg); }
   .r-等待回落 { background: var(--line); color: var(--muted); }
   .r-回补区 { background: #e8f1ff; color: var(--blue); }
   .r-可买回 { background: var(--green-bg); color: var(--green); font-weight: 600; }
@@ -68,6 +72,14 @@
   #ready { display: none; background: var(--green-bg); color: var(--green); border-radius: 12px;
            padding: 14px 18px; margin-bottom: 16px; }
   #report { white-space: pre-wrap; font: inherit; margin: 12px 0 0; }
+  #ppModal { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none;
+             align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  #ppModal .box { background: var(--card); border-radius: 14px; padding: 22px; max-width: 460px; width: 100%; }
+  #ppModal h2 { font-size: 18px; margin: 0 0 8px; }
+  #ppModal ol { padding-left: 20px; margin: 10px 0; }
+  #ppModal .free { display: inline-block; background: var(--green-bg); color: var(--green); border-radius: 6px;
+                   padding: 1px 8px; font-size: 12px; font-weight: 600; }
+  #ppModal .actions { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; margin-top: 16px; }
   .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg);
            padding: 10px 16px; border-radius: 10px; max-width: 90vw; display: none; }
 </style>
@@ -77,6 +89,7 @@
   <header>
     <h1>纪律机器人</h1>
     <span class="pill">模拟运行 · 自动下单未启用</span>
+    <span class="pill" id="who" style="display:none"></span>
     <span class="clock muted" id="clock"></span>
   </header>
 
@@ -100,6 +113,15 @@
   </section>
 
   <section class="card">
+    <h2>买前体检 <span class="muted" style="font-weight:400">想买之前先查一下，"不建议"的票建仓会被拦住</span></h2>
+    <div class="row">
+      <input id="ckCode" placeholder="股票代码" maxlength="6">
+      <button class="primary" onclick="runCheckup()">体检</button>
+    </div>
+    <pre id="ckReport" class="report" style="display:none"></pre>
+  </section>
+
+  <section class="card">
     <h2>建仓 · 锁定支撑位</h2>
     <div class="row">
       <input id="code" placeholder="股票代码，如 000333" maxlength="6">
@@ -108,6 +130,8 @@
       <input id="manual" placeholder="支撑位价格">
       <input id="shares" placeholder="股数（可不填）" style="width:120px">
       <button onclick="addManual()">手动锁定</button>
+      <label class="muted" title="已经持有的票补录进来盯着：照样体检、照样受止损纪律管，只是不拦">
+        <input type="checkbox" id="existing" style="width:auto"> 已有持仓补录</label>
     </div>
     <div id="platforms"></div>
   </section>
@@ -128,6 +152,40 @@
     </section>
   </div>
 
+  <section class="card" id="tokenCard" style="display:none">
+    <h2>微信提醒设置</h2>
+    <p class="muted">清仓信号、催卖、收盘简报会推送到你自己的微信。打开 <a href="https://www.pushplus.plus" target="_blank">pushplus.plus</a>
+      微信扫码登录 → 关注公众号 → 在"一对一推送"页面复制 token 填到这里。<b id="tokenState"></b></p>
+    <div class="row">
+      <input id="token" placeholder="PushPlus token" style="width:300px">
+      <button class="primary" onclick="saveToken()">保存</button>
+      <button onclick="post('/api/test-alert').then(()=>toast('已发测试消息，看看微信收到没'))">发一条测试</button>
+    </div>
+  </section>
+
+  <section class="card" id="feedbackCard" style="display:none">
+    <h2>提意见</h2>
+    <p class="muted">哪条规则不合理、哪里不好用、哪次判断跟你想的不一样，都写在这里，会直接发给主控台。</p>
+    <textarea id="fbText" rows="3" style="width:100%;font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)"
+      placeholder="例如：10-28 北大荒收盘 13.20，我觉得已经企稳了，但还在回补区第 2 天……"></textarea>
+    <p><button class="primary" onclick="sendFeedback()">发送</button></p>
+  </section>
+
+  <section class="card" id="adminCard" style="display:none">
+    <h2>分控台管理 <span class="muted" style="font-weight:400">给朋友用，各自数据独立，钥匙在你这里</span></h2>
+    <div class="row">
+      <input id="tnName" placeholder="朋友的称呼，比如 老王">
+      <button class="primary" onclick="createTenant()">创建分控台</button>
+    </div>
+    <pre id="tnNew" class="report" style="display:none"></pre>
+    <table style="margin-top:12px">
+      <thead><tr><th>分控台</th><th>状态</th><th>最近登录</th><th>持仓</th><th>意见</th><th>频繁操作</th><th></th></tr></thead>
+      <tbody id="tnList"></tbody>
+    </table>
+    <h2 style="margin-top:18px">朋友的意见</h2>
+    <div class="list" id="tnFeedback"></div>
+  </section>
+
   <section class="card">
     <h2>工具</h2>
     <div class="row">
@@ -143,13 +201,35 @@
 </main>
 <div class="toast" id="toast"></div>
 
+<div id="ppModal">
+  <div class="box">
+    <h2>开通微信提醒 <span class="free">免费</span></h2>
+    <p>纪律机器人用 <b>PushPlus</b> 把提醒推送到你的微信。PushPlus 是免费的微信推送服务，<b>不用花钱</b>，微信扫个码就能开通。</p>
+    <p class="muted">开通后，清仓信号、催卖、收盘简报都会直接发到微信，不用一直开着这个网页。不开通的话，提醒只能在这个页面里看到，很容易错过。</p>
+    <ol>
+      <li>打开 <a href="https://www.pushplus.plus" target="_blank">pushplus.plus</a>，用微信扫码登录</li>
+      <li>关注"pushplus 推送加"公众号（提醒就是从这个公众号发给你）</li>
+      <li>进入"一对一推送"页面，复制 token，粘贴到下面</li>
+    </ol>
+    <input id="ppToken" placeholder="粘贴 PushPlus token（可以先不填）" style="width:100%">
+    <div class="actions">
+      <button onclick="closePushplus()">关闭</button>
+      <button onclick="closePushplus()">跳过一次</button>
+      <button class="primary" onclick="ackPushplus()">已开通</button>
+    </div>
+    <p class="muted" style="margin:10px 0 0;font-size:12px">"关闭"和"跳过一次"下次进来还会提醒；点"已开通"以后就不再弹出。</p>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
-let found = null, alarmOn = false, audioCtx = null;
+let found = null, alarmOn = false, audioCtx = null, pushplusPrompted = false;
 
 async function api(url, opts) {
   const r = await fetch(url, opts);
+  if (r.status === 401) { location.reload(); throw new Error('需要重新登录'); }
   const j = await r.json();
+  if (j.rate_limited) { alert('⚠️ ' + j.error); throw new Error(j.error.split('\n')[0]); }
   if (!j.ok) throw new Error(j.error);
   return j;
 }
@@ -174,6 +254,18 @@ async function refresh() {
   let s;
   try { s = await api('/api/state'); } catch (e) { $('clock').textContent = '⚠️ 连不上机器人，它可能已经关了'; return; }
   $('clock').textContent = `北京时间 ${s.now}` + (s.trading_day === false ? ' · 今天休市' : '');
+  const friend = s.role === 'friend';
+  $('who').style.display = 'inline'; $('who').textContent = friend ? `分控台 · ${s.account}` : '主控台';
+  $('tokenCard').style.display = friend ? 'block' : 'none';
+  $('feedbackCard').style.display = friend ? 'block' : 'none';
+  $('tokenState').textContent = s.has_token ? '（已设置）' : '（还没设置，现在提醒只能在这个页面看到）';
+  $('tokenState').style.color = s.has_token ? 'var(--green)' : 'var(--red)';
+  if (!friend && $('adminCard').style.display === 'none') { $('adminCard').style.display = 'block'; loadTenants(); }
+  // 分控台每次打开页面提醒一次开通微信推送，直到点"已开通"（或已经填了 token）
+  if (friend && !s.has_token && !s.pushplus_ack && !pushplusPrompted) {
+    pushplusPrompted = true;
+    $('ppModal').style.display = 'flex';
+  }
   $('sched').textContent = s.scheduler.length ? `最近：${s.scheduler[0]}` : '';
   if (s.briefing) {
     $('briefing').textContent = s.briefing.text; $('briefing').classList.remove('muted');
@@ -182,7 +274,8 @@ async function refresh() {
 
   $('holdings').innerHTML = s.holdings.map(h => `
     <tr>
-      <td>${esc(h.name)} <span class="muted">${h.code}</span>${h.shares ? `<div class="muted">${h.shares} 股</div>` : ''}</td>
+      <td>${esc(h.name)} <span class="muted">${h.code}</span>${h.shares ? `<div class="muted">${h.shares} 股</div>` : ''}
+          ${h.checkup ? `<div><span class="badge v-${h.checkup.verdict}">体检 ${h.checkup.verdict}</span></div>` : ''}</td>
       <td class="num">${h.support}</td>
       <td style="white-space:nowrap">${esc(h.level)}</td>
       <td><span class="badge s-${h.status}">${h.status}</span>
@@ -231,13 +324,27 @@ async function refresh() {
   }).join('') || '<div class="muted">还没有记录</div>';
 }
 
+async function runCheckup() {
+  const code = $('ckCode').value.trim();
+  $('ckReport').style.display = 'block'; $('ckReport').textContent = '体检中…（第一次要十几秒）';
+  try { $('ckReport').textContent = (await post('/api/checkup', {code})).report; }
+  catch (e) { $('ckReport').textContent = e.message; }
+}
+
 async function findPlatforms() {
   const code = $('code').value.trim();
-  $('platforms').innerHTML = '<p class="muted">查找中…</p>';
+  $('platforms').innerHTML = '<p class="muted">体检并查找平台中…</p>';
   try {
-    found = await post('/api/platforms', {code});
-    $('platforms').innerHTML = `<p>${esc(found.name)}（${found.code}）最新收盘 <b>${found.price}</b>（${found.date}）</p>` +
-      (found.platforms.length ? found.platforms.map((p, i) => `
+    const [ck, pf] = await Promise.all([post('/api/checkup', {code}), post('/api/platforms', {code})]);
+    found = pf;
+    const blocked = ck.verdict === '不建议' && !$('existing').checked;
+    $('platforms').innerHTML =
+      `<p>${esc(found.name)}（${found.code}）最新收盘 <b>${found.price}</b>（${found.date}）
+         <span class="badge v-${ck.verdict}">体检：${ck.verdict}${ck.score ? ' ' + ck.score : ''}</span></p>
+       <details ${ck.verdict !== '值得考虑' ? 'open' : ''}><summary class="muted">体检报告</summary>
+         <pre class="report">${esc(ck.report)}</pre></details>` +
+      (blocked ? '<p style="color:var(--red)"><b>⛔ 体检不建议，不能建仓。</b>如果这是已经持有的票，勾选「已有持仓补录」再点一次找平台。</p>' :
+      found.platforms.length ? found.platforms.map((p, i) => `
         <label class="platform"><input type="radio" name="pf" value="${i}" ${i === 0 ? 'checked' : ''}>
           <span><b>${p.level}</b> ${p.start} ~ ${p.end}，${p.days} 天，区间 ${p.low}–${p.high}</span>
           <span style="margin-left:auto">支撑位 <b>${p.support}</b></span></label>`).join('') +
@@ -251,9 +358,10 @@ const LOCK_WARN = '锁定后只能上移，不能下移。\n收盘跌破 → 观
 async function lock(code, support, level, platform) {
   if (!confirm(`${code} 支撑位 ${support}\n\n${LOCK_WARN}`)) return;
   try {
-    await post('/api/add', {code, support, level, platform, shares: $('shares').value});
-    toast('已锁定'); $('platforms').innerHTML = ''; $('code').value = ''; $('manual').value = ''; $('shares').value = ''; refresh();
-  } catch (e) { toast(e.message); }
+    await post('/api/add', {code, support, level, platform, shares: $('shares').value, existing: $('existing').checked});
+    toast('已锁定'); $('platforms').innerHTML = ''; $('code').value = ''; $('manual').value = ''; $('shares').value = '';
+    $('existing').checked = false; refresh();
+  } catch (e) { toast(e.message.split('\n')[0], 6000); if (e.message.includes('体检')) findPlatforms(); }
 }
 function addPicked() {
   const p = found.platforms[document.querySelector('input[name=pf]:checked').value];
@@ -346,6 +454,80 @@ async function rebought(code) {
   try { const r = await post('/api/rebuy', {code, price: v, qty}); toast(r.message, 7000); }
   catch (e) { toast(e.message); }
   refresh();
+}
+
+async function loadTenants() {
+  try {
+    const r = await api('/api/admin/tenants');
+    $('tnList').innerHTML = r.tenants.map(t => `
+      <tr>
+        <td>${esc(t.name)} <div class="muted">账号 ${t.id} · ${t.created} 创建${t.has_token ? '' : ' · 未设微信'}</div></td>
+        <td><span class="badge ${t.enabled ? 's-持有' : 's-待卖出'}">${t.enabled ? '使用中' : '已停用'}</span></td>
+        <td class="muted">${t.last_seen || '从没登录'}</td>
+        <td class="num">${t.holdings} 只</td>
+        <td class="num">${t.feedback} 条</td>
+        <td class="num" style="color:${t.rate_limited ? 'var(--red)' : 'inherit'}">${t.rate_limited} 次
+          ${t.last_rate_limited ? `<div class="muted">${t.last_rate_limited}</div>` : ''}</td>
+        <td><div class="row">
+          ${t.enabled ? `<button class="danger" onclick="tenantAction('${t.id}','disable','停用「${esc(t.name)}」？他会立刻登不进去，数据保留。')">停用</button>`
+                      : `<button onclick="tenantAction('${t.id}','enable')">恢复</button>`}
+          <button onclick="tenantAction('${t.id}','reset','重置「${esc(t.name)}」的密码？旧密码立刻失效。')">重置密码</button>
+          <button onclick="tenantAction('${t.id}','delete','删除「${esc(t.name)}」？他的持仓和日志会被永久清除，不能恢复。')">删除</button>
+        </div></td>
+      </tr>`).join('') || '<tr><td colspan="7" class="muted">还没有分控台。</td></tr>';
+    $('tnFeedback').innerHTML = r.feedback.map(f => `
+      <div class="item"><b>${esc(f.name)}</b> <span class="muted">${f.time}</span><pre>${esc(f.text)}</pre></div>`).join('')
+      || '<div class="muted">还没有意见</div>';
+  } catch (e) { toast(e.message); }
+}
+
+function showCredentials(name, id, password) {
+  $('tnNew').style.display = 'block';
+  $('tnNew').textContent = `把下面这段发给「${name}」（密码只显示这一次）：\n\n` +
+    `纪律机器人分控台\n网址：${location.origin}\n用户名：${id}\n密码：${password}\n\n` +
+    `登录后先在「微信提醒设置」里填自己的 PushPlus token。`;
+}
+
+async function createTenant() {
+  const name = $('tnName').value.trim();
+  if (!name) return toast('先填朋友的称呼');
+  try {
+    const r = await post('/api/admin/tenants', {name});
+    showCredentials(r.name, r.id, r.password); $('tnName').value = ''; loadTenants();
+  } catch (e) { toast(e.message); }
+}
+
+async function tenantAction(id, action, ask) {
+  if (ask && !confirm(ask)) return;
+  try {
+    const r = await post(`/api/admin/tenants/${id}/${action}`);
+    if (action === 'reset') showCredentials(id, id, r.password);
+    toast('已完成'); loadTenants();
+  } catch (e) { toast(e.message); }
+}
+
+function closePushplus() { $('ppModal').style.display = 'none'; }
+
+async function ackPushplus() {
+  const token = $('ppToken').value.trim();
+  try {
+    await post('/api/settings', token ? {pushplus_token: token, pushplus_ack: true} : {pushplus_ack: true});
+    closePushplus();
+    toast(token ? '已保存，点「发一条测试」看看微信收到没' : '好的，以后不再弹出。token 可以在「微信提醒设置」里填');
+    refresh();
+  } catch (e) { toast(e.message); }
+}
+
+async function saveToken() {
+  try { await post('/api/settings', {pushplus_token: $('token').value}); $('token').value = ''; toast('已保存'); refresh(); }
+  catch (e) { toast(e.message); }
+}
+
+async function sendFeedback() {
+  const text = $('fbText').value.trim();
+  if (!text) return toast('先写点内容');
+  try { await post('/api/feedback', {text}); $('fbText').value = ''; toast('已发给主控台，谢谢！'); }
+  catch (e) { toast(e.message); }
 }
 
 async function runJob(job, label) {

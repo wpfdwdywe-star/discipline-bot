@@ -10,3 +10,8 @@ __pycache__/
 
 # 系统
 .DS_Store
+
+# 分控台账号数据、日志、部署压缩包
+tenants/
+*.log
+*.zip

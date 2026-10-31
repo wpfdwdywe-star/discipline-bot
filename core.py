@@ -7,9 +7,11 @@ import time
 import traceback
 
 import analysis
+import checkup
 import data
 import rules
 import store
+import tenants
 from notify import push
 from store import NORMAL, SELL, WATCH
 
@@ -66,24 +68,56 @@ def candidate_platforms(code: str) -> dict:
             "platforms": [{**p.__dict__, "level": p.level} for p in platforms]}
 
 
+def pre_buy_checkup(code: str) -> dict:
+    """买前体检。结果按天缓存（建仓时直接用当天的结果，不重复取数）。"""
+    f = store.dir() / "checkups" / f"{code}.json"
+    if f.exists():
+        saved = json.loads(f.read_text())
+        if saved["date"] == data.today():
+            return saved
+    bars = data.daily_bars(code, days=300)
+    name = data.stock_name(code)
+    c = checkup.evaluate(code, name, data.financial_abstract(code), bars, rules.find_platforms(bars, limit=8),
+                         data.valuation(code, "市盈率(TTM)"), data.valuation(code, "市净率"), data.top10_holders(code))
+    price = float(bars["close"].iloc[-1])
+    result = {"date": data.today(), "code": code, "name": name, "price": price, "verdict": c.verdict,
+              "score": c.score if c.signals else None, "vetoes": c.vetoes, "cautions": c.cautions,
+              "support": c.support, "report": checkup.report(c, price)}
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(result, ensure_ascii=False))
+    store.log("体检", code, name=name, verdict=c.verdict, score=result["score"])
+    return result
+
+
 @locked
 def add_holding(code: str, support: float, level: str = "手动", platform: str | None = None,
-                shares: int | None = None) -> dict:
+                shares: int | None = None, existing: bool = False) -> dict:
+    """建仓。新买入必须过买前体检，"不建议"直接拦住；existing=True 是补录已经持有的票（照样体检、照样受止损纪律管，
+    只是不拦，因为拦了反而没人盯它），体检不建议的补录会记进日志。"""
     state = _load()
     if code in state["holdings"]:
         raise Refused(f"{code} 已在持仓里。要改支撑位请用「上移支撑」。")
+    check = pre_buy_checkup(code)
+    if check["verdict"] == checkup.VERDICT_NO:
+        if not existing:
+            store.log("拦截建仓", code, name=check["name"], note="；".join(check["vetoes"]) or f"财务体检 {check['score']}")
+            push(f"⛔ 拦截建仓 {check['name']}({code})", check["report"], "warn")
+            raise Refused(f"拦截：{check['name']} 买前体检「不建议」，不能建仓。\n\n{check['report']}")
+        store.log("补录不建议", code, name=check["name"], note="已有持仓补录，体检结论为不建议")
     bars = data.daily_bars(code, days=30)
     last = float(bars["close"].iloc[-1])
     support = round(support, 2)
     if support >= last:
         raise Refused(f"支撑位 {support} 不低于现价 {last}，等于一买就跌破，请重新选。")
-    h = {"code": code, "name": data.stock_name(code), "support": support, "level": level,
-         "platform": platform, "added": data.today(), "status": NORMAL, "last_price": last}
+    h = {"code": code, "name": check["name"], "support": support, "level": level,
+         "platform": platform, "added": data.today(), "status": NORMAL, "last_price": last,
+         "checkup": {"date": check["date"], "verdict": check["verdict"], "score": check["score"]}}
     if shares:
         h["shares"] = shares
     state["holdings"][code] = h
     store.save(state)
-    store.log("建仓", code, name=h["name"], support=support, level=level, price=last, shares=shares)
+    store.log("建仓", code, name=h["name"], support=support, level=level, price=last, shares=shares,
+              verdict=check["verdict"], existing=existing)
     return h
 
 
@@ -387,7 +421,7 @@ def nag_pending() -> int:
 # ---------------- 盘中监控 ----------------
 
 def _intraday_file():
-    return store.DIR / "intraday.json"
+    return store.dir() / "intraday.json"
 
 
 def _intraday_state() -> dict:
@@ -400,7 +434,7 @@ def _intraday_state() -> dict:
 
 @locked
 def monitor_intraday() -> int:
-    """交易时段每 5 分钟看一次盘。严重的立刻推；一般的上午攒到 13:00、下午直接推。同一情况一天一次。"""
+    """交易时段每 5 分钟看一次盘。严重的立刻推；一般的上午攒到 11:31 收盘后、下午直接推。同一情况一天一次。"""
     state = _load()
     seen = _intraday_state()
     today = data.today()
@@ -441,12 +475,20 @@ def monitor_intraday() -> int:
 
 @locked
 def flush_morning_digest() -> int:
-    """13:00 把上午攒下的一般情况一次发出去。没有就不发。"""
+    """上午收盘（11:31）把上午攒下的一般情况一次发出去。没有情况也报一声「一切正常」，没有持仓的账号不发。"""
     seen = _intraday_state()
     queue = seen["queue"]
+    hs = list(_load()["holdings"].values())
     if queue:
         push("📋 上午盘中情况（上午走势权重低，仅供参考）",
              "\n".join(queue) + "\n\n正式判断仍以 14:40 和收盘为准。", "info")
+    elif hs:
+        lines = [f"上午收盘，监控 {len(hs)} 只股票，都没有触发提醒。"]
+        for h in hs:
+            price = h.get("last_price")
+            where = f" 现价 {price}（距止损位 {price / h['support'] - 1:+.1%}）" if price else ""
+            lines.append(f"  · {_fmt(h)}{where}")
+        push("✅ 上午一切正常", "\n".join(lines) + "\n\n下午照常盯盘，14:40 和收盘仍会检查。", "info")
     seen["queue"] = []
     _intraday_file().write_text(json.dumps(seen, ensure_ascii=False))
     return len(queue)
@@ -455,7 +497,7 @@ def flush_morning_digest() -> int:
 # ---------------- 收盘简报 ----------------
 
 def _briefing_file():
-    return store.DIR / "briefing.json"
+    return store.dir() / "briefing.json"
 
 
 def last_briefing() -> dict | None:
@@ -468,18 +510,18 @@ def daily_briefing(final: bool = True) -> int:
     """收盘后逐只分析，推送简报。新出现的风险信号记进日志（月报会统计）。"""
     state = _load()
     today = data.today()
-    # 标题用行情数据的日期（盘前手动生成时是上一个交易日的收盘）
-    day = today
-    lines = []
+    if not state["holdings"]:
+        return 0  # 没有持仓就不发简报
+    idx_line = "沪深300 数据暂时拿不到"
+    idx_date = None
     try:
         idx = data.index_bars()
         c0, c1 = float(idx["close"].iloc[-2]), float(idx["close"].iloc[-1])
-        day = str(idx["date"].iloc[-1]) if "date" in idx else today
-        lines.append(f"沪深300 {c1:.2f}（{(c1 / c0 - 1) * 100:+.2f}%）")
+        idx_date = str(idx["date"].iloc[-1])
+        idx_line = f"沪深300 {c1:.2f}（{(c1 / c0 - 1) * 100:+.2f}%）"
     except Exception:
         pass
-    lines.insert(0, f"📊 {day} 收盘简报")
-    sections, summary = [], {"risk": [], "watch": []}
+    sections, summary, bar_dates = [], {"risk": [], "watch": []}, []
     for h in state["holdings"].values():
         try:
             bars = data.daily_bars(h["code"], days=300)
@@ -487,6 +529,7 @@ def daily_briefing(final: bool = True) -> int:
             sections.append(f"【{_fmt(h)}】行情拿不到，今天跳过")
             continue
         t = analysis.trend(bars)
+        bar_dates.append(t["date"])
         f = analysis.fundamentals(data.financial_abstract(h["code"]))
         sig = analysis.signals(t, f, h["support"])
         new = [r for r in sig.risks if r not in h.get("risk_flags", [])]
@@ -508,6 +551,11 @@ def daily_briefing(final: bool = True) -> int:
         head += f"，⚠️ 注意：{'、'.join(summary['watch'])}"
     if n and not summary["risk"] and not summary["watch"]:
         head += "，全部正常"
+    # 标题用个股行情的日期（盘前手动生成时是上一个交易日）；指数日期对不上就明说，不把旧数据当今天的
+    day = max(bar_dates) if bar_dates else (idx_date or today)
+    if idx_date and idx_date != day:
+        idx_line += f"  ⚠️ 这是 {idx_date} 的数据，{day} 的还没更新"
+    lines = [f"📊 {day} 收盘简报", idx_line]
     lines += [head, ""] + ["\n\n".join(sections)]
     lines.append("\n（看法基于均线和财报指标的规则判断，只是提醒，不构成投资建议；止损信号除外，那是纪律。）")
     text = "\n".join(lines)
@@ -527,6 +575,7 @@ def build_report(month: str | None = None) -> str:
     all_sold = [e for e in store.events() if e["kind"] == "卖出"]
     violations = [e for e in evs if e["kind"] == "违规"]
     risks = [e for e in evs if e["kind"] == "风险提示"]
+    blocked = [e for e in evs if e["kind"] in ("拦截建仓", "补录不建议")]
 
     lines = [f"📋 {month} 纪律报告", ""]
     lines.append(f"跌破 {sum(e['kind'] == '跌破' for e in evs)} 次，"
@@ -548,6 +597,9 @@ def build_report(month: str | None = None) -> str:
             lines.append(f"  ⚠️ {s['code']} {s['time'][:10]} 信号价 {s['price']}  拖了{sold['delay_days']}天才卖 {sold['price'] or ''}  {after}")
     if signals:
         lines.append(f"\n按时执行率：{on_time}/{len(signals)}")
+    if blocked:
+        lines.append(f"\n买前体检拦截 / 补录 {len(blocked)} 次：")
+        lines += [f"  · {e['time'][:10]} {e['kind']} {e.get('name', e['code'])}" for e in blocked]
     if risks:
         lines.append(f"\n风险提示 {len(risks)} 条：")
         lines += [f"  · {e['time'][:10]} {e['note']}" for e in risks]
@@ -562,9 +614,20 @@ def _is_month_end() -> bool:
 
 
 @locked
+def monthly_report() -> None:
+    """月末推送本月纪律报告。整个月没有持仓也没有任何记录的账号不发。"""
+    month = data.today()[:7]
+    if not _load()["holdings"] and not store.events(month):
+        return
+    push(f"📋 {month} 纪律报告", build_report(month), "warn")
+
+
+@locked
 def morning_call() -> None:
     """交易日早上报平安：没收到这条，说明机器人被关了。"""
     hs = list(_load()["holdings"].values())
+    if not hs:
+        return  # 没有持仓的账号（比如刚开的分控台）不发，免得每天收一条"监控 0 只"
     lines = [f"今天在岗，监控 {len(hs)} 只股票。"]
     for h in hs:
         note = {WATCH: "今天是观察日，14:40 判断是否有效收回",
@@ -590,39 +653,62 @@ def missed_checks(last: dt.datetime, now: dt.datetime) -> list[str]:
 # ---------------- 定时 ----------------
 
 class Scheduler:
-    """北京时间（交易日）：9:15 报平安，交易时段每 5 分钟盘中监控（13:00 发上午汇总），
-    14:40 观察日检查，14:40–14:57 每 3 分钟催卖，15:30 收盘检查 → 收盘简报。
+    """北京时间（交易日）：9:15 报平安，交易时段每 5 分钟盘中监控（11:31 补看一轮后发上午汇总），
+    14:40 观察日检查，14:40–14:57 每 3 分钟催卖，15:30 收盘检查 → 收盘简报（月末再发月度纪律报告）。
 
+    每个账号（主控台 + 启用中的分控台）各跑一遍，各用各的数据、各推各的微信。
     晚开/重启：报平安在 14:40 前补发；14:40 检查在 14:57 前补跑；收盘检查当天 15:30 之后任何时候补跑。
-    停机覆盖了 14:40–15:30 检查时段 → 重新上线时：人为停止记违规，平台休眠/故障记「故障」。
+    停机覆盖了 14:40–15:30 检查时段 → 重新上线时：主控台人为停止记违规，其余情况记「故障」
+    （分控台的朋友关不了服务器，停机永远不算他们违规）。
     """
 
     NAG_EVERY = 180
+    DIGEST_AT = dt.time(11, 31)  # 上午收盘后马上发汇总，别拖到下午开盘
     GRACE = dt.timedelta(minutes=5)  # 心跳间隔 20 秒，短于这个的空档不算停机
-    CLOCK_SYNC_EVERY = 600
+    SKEW_TOLERANCE = 60     # 系统时钟和网络时间差超过 60 秒，说明时钟不可信
+    SKEW_PATIENCE = 3       # 连续 3 轮（约 1 分钟）都不准，才改用网络时间；之前先不跑任务，等平台校准
     MONITOR_EVERY = 300
 
     def __init__(self):
         self.done: set = set()
-        self.last_nag = 0.0
-        self.last_sync = 0.0
+        self.last_nag: dict[str, float] = {}
+        self.skew_strikes = 0
+        self._today = ""
         self.last_wall = 0.0
         self.log: list[str] = []
         self.thread: threading.Thread | None = None
         self._tick_lock = threading.Lock()
-        self.last_try: dict[str, float] = {}
-        self.last_monitor = 0.0
+        self.last_try: dict[tuple[str, str], float] = {}
+        self.last_monitor: dict[str, float] = {}
+
+    @staticmethod
+    def _k(name: str) -> str:
+        """任务键：主控台保持原样（兼容升级前的记录），分控台加账号前缀。"""
+        tid = store.tenant()
+        return name if tid == store.MAIN else f"{tid}|{name}"
+
+    @staticmethod
+    def accounts() -> list[str]:
+        return [store.MAIN] + tenants.active_ids()
 
     @property
     def _file(self):
-        return store.DIR / "scheduler.json"
+        return store.ROOT / "scheduler.json"
 
     def _note(self, msg: str) -> None:
-        self.log = ([f"{data.now():%m-%d %H:%M:%S} {msg}"] + self.log)[:30]
+        who = "" if store.tenant() == store.MAIN else f"[{tenants.name(store.tenant())}] "
+        self.log = ([f"{data.now():%m-%d %H:%M:%S} {who}{msg}"] + self.log)[:30]
+
+    def notes(self) -> list[str]:
+        """当前账号能看到的调度日志：主控台看全部，分控台只看带自己名字的。"""
+        if store.tenant() == store.MAIN:
+            return self.log
+        mine = f"[{tenants.name(store.tenant())}] "
+        return [x for x in self.log if mine in x]
 
     def _save(self, stopped: bool = False) -> None:
         today = data.today()
-        store.DIR.mkdir(parents=True, exist_ok=True)
+        store.ROOT.mkdir(parents=True, exist_ok=True)
         state = {"heartbeat": data.now().isoformat(),
                  "done": sorted(k for d, k in self.done if d == today), "date": today}
         if stopped:
@@ -631,6 +717,26 @@ class Scheduler:
 
     def mark_stopped(self) -> None:
         self._save(stopped=True)
+
+    def _outage(self, last: dt.datetime, now: dt.datetime, manual: bool, how: str) -> None:
+        """停机/休眠错过了检查：逐个账号记录。只有主控台的人为停止算违规。"""
+        hours = (now - last).total_seconds() / 3600
+        missed = missed_checks(last, now)
+        if not missed:
+            return
+        when = "、".join(missed)
+        for tid in self.accounts():
+            with store.as_tenant(tid):
+                if manual and tid == store.MAIN:
+                    store.log("违规", note=f"机器人被人为停止 {hours:.1f} 小时，错过了 {when} 的检查")
+                    push("⚠️ 机器人被关掉，错过了检查",
+                         f"上次在线 {last:%m-%d %H:%M}，被停止了 {hours:.1f} 小时。\n"
+                         f"错过了 {when} 的 14:40/收盘检查，已记违规。", "warn")
+                else:
+                    store.log("故障", note=f"机器人{how} {hours:.1f} 小时，错过了 {when} 的检查")
+                    push(f"⚠️ 机器人{how}，错过了检查",
+                         f"{last:%m-%d %H:%M} 到 {now:%m-%d %H:%M} 机器{how}，错过了 {when} 的检查，不记违规。\n"
+                         f"醒来后已补做能补的检查。" + ("请检查定时唤醒是否正常。" if tid == store.MAIN else ""), "warn")
 
     def check_downtime(self) -> None:
         """启动时：读上次心跳，看停机期间有没有错过检查；恢复当天已完成的任务。"""
@@ -642,44 +748,30 @@ class Scheduler:
         last, now = dt.datetime.fromisoformat(saved["heartbeat"]), data.now()
         if now - last < self.GRACE:
             return
-        missed = missed_checks(last, now)
-        hours = (now - last).total_seconds() / 3600
-        if missed and saved.get("stopped") == "manual":
-            store.log("违规", note=f"机器人被人为停止 {hours:.1f} 小时，错过了 {'、'.join(missed)} 的检查")
-            push("⚠️ 机器人被关掉，错过了检查",
-                 f"上次在线 {last:%m-%d %H:%M}，被停止了 {hours:.1f} 小时。\n"
-                 f"错过了 {'、'.join(missed)} 的 14:40/收盘检查，已记违规。", "warn")
-        elif missed:
-            # 没收到停止信号就断了：平台休眠没被唤醒、机器故障等，不算你违规，但要让你知道
-            store.log("故障", note=f"机器人离线 {hours:.1f} 小时（非人为停止），错过了 {'、'.join(missed)} 的检查")
-            push("⚠️ 机器人离线，错过了检查",
-                 f"上次在线 {last:%m-%d %H:%M}，离线 {hours:.1f} 小时，错过了 {'、'.join(missed)} 的检查。\n"
-                 f"看起来是服务器休眠没被唤醒或故障，不记违规。请检查定时唤醒是否正常。", "warn")
-        self._note(f"重新上线，离线 {hours:.1f} 小时")
+        manual = saved.get("stopped") == "manual"
+        self._outage(last, now, manual, "被停止" if manual else "离线（非人为停止）")
+        self._note(f"重新上线，离线 {(now - last).total_seconds() / 3600:.1f} 小时")
 
     def _frozen(self, last: dt.datetime, now: dt.datetime) -> None:
         """进程被冻结后恢复（平台休眠没被及时唤醒）：错过了检查时段就记故障。"""
-        hours = (now - last).total_seconds() / 3600
-        missed = missed_checks(last, now)
-        if missed:
-            store.log("故障", note=f"机器人休眠 {hours:.1f} 小时，错过了 {'、'.join(missed)} 的检查")
-            push("⚠️ 机器人休眠，错过了检查",
-                 f"{last:%m-%d %H:%M} 到 {now:%m-%d %H:%M} 机器在休眠，错过了 {'、'.join(missed)} 的检查。\n"
-                 f"醒来后已补做能补的检查。请检查定时唤醒（cron-job.org）是否正常。", "warn")
-        self._note(f"从休眠恢复，睡了 {hours:.1f} 小时")
+        self._outage(last, now, False, "休眠")
+        self._note(f"从休眠恢复，睡了 {(now - last).total_seconds() / 3600:.1f} 小时")
 
     INTRADAY_FINAL = dt.time(14, 52)   # 这之后不再等数据，用最新能拿到的判断（还留 5 分钟下单）
     CLOSE_FINAL = dt.time(17, 0)       # 这之后还没有当天日K，才按停牌处理
-    RETRY = {"intraday": 60, "close": 300, "morning": 300, "briefing": 300, "digest": 60}
+    RETRY = {"intraday": 60, "close": 300, "morning": 300, "briefing": 300, "digest": 60, "report": 300}
 
-    def _run(self, key, job, label: str, final: bool = True) -> None:
+    def _done(self, name: str) -> bool:
+        return (self._today, self._k(name)) in self.done
+
+    def _run(self, name, job, label: str, final: bool = True) -> None:
         """跑一次任务。没完成（数据没更新 / 出错）且不是最后一次 → 不标记完成，过一会儿重试。"""
-        today = data.today()
-        if time.time() - self.last_try.get(key, 0) < self.RETRY.get(key, 60):
+        today, key = self._today, self._k(name)
+        if time.time() - self.last_try.get((today, key), 0) < self.RETRY.get(name, 60):
             return
-        self.last_try[key] = time.time()
+        self.last_try[(today, key)] = time.time()
         try:
-            pending = job(final=final) if key in ("intraday", "close", "briefing") else job()
+            pending = job(final=final) if name in ("intraday", "close", "briefing") else job()
         except Exception:
             if final:
                 self.done.add((today, key))
@@ -701,48 +793,82 @@ class Scheduler:
         finally:
             self._tick_lock.release()
 
+    def _clock_ok(self) -> bool:
+        """跑任务前先跟网络时间对表。
+
+        机器刚从休眠醒来时，系统时钟有几秒停在暂停那一刻，之后平台才校准。2026-10-28 就出过事：调度器读到
+        "旧时刻 + 新日期"，以为当天已过 17:00，把收盘检查和简报标记成已完成，真正的 15:30 就跳过了。
+        所以时钟对不上时这一轮什么都不做；连续几轮都对不上（系统时钟一直不准），才改用网络时间。
+        """
+        skew = data.clock_skew()
+        if skew is None:
+            return True  # 网络不通，拿不到网络时间；任务本身也取不到数，按系统时钟走
+        error = skew - data._clock_offset
+        if abs(error) <= self.SKEW_TOLERANCE:
+            self.skew_strikes = 0
+            return True
+        self.skew_strikes += 1
+        if self.skew_strikes < self.SKEW_PATIENCE:
+            self._note(f"系统时钟和网络时间差 {error:+.0f} 秒（可能刚从休眠醒来还没校准），这一轮先不跑任务")
+            return False
+        data._clock_offset = round(skew) if abs(skew) > self.SKEW_TOLERANCE else 0.0
+        self.skew_strikes = 0
+        self._note(f"系统时钟持续不准，改用网络时间（校正 {data._clock_offset:+.0f} 秒）")
+        return True
+
     def _tick(self) -> None:
-        # 休眠恢复后（墙上时间跳了一大截）或每 10 分钟，用网络时间校正时钟
+        if not self._clock_ok():
+            return
         wall = time.time()
-        if wall - self.last_wall > 90 or wall - self.last_sync > self.CLOCK_SYNC_EVERY:
-            offset = data.sync_clock()
-            self.last_sync = wall
-            if offset:
-                self._note(f"系统时钟偏差 {offset:+.0f} 秒，已按网络时间校正")
         now = data.now()
         if self.last_wall and wall - self.last_wall > self.GRACE.total_seconds():
             self._frozen(now - dt.timedelta(seconds=wall - self.last_wall), now)
         self.last_wall = wall
-        t = now.time()
-        if data.is_trading_day():
-            today = data.today()
-            if dt.time(9, 15) <= t < dt.time(14, 40) and (today, "morning") not in self.done:
-                self._run("morning", morning_call, "报平安")
-            in_session = dt.time(9, 30) <= t < dt.time(11, 30) or dt.time(13, 0) <= t < dt.time(15, 0)
-            if in_session and time.time() - self.last_monitor >= self.MONITOR_EVERY:
-                self.last_monitor = time.time()
+        # 这一轮的日期和时刻都从同一个 now 算，不在中途重新读时钟
+        self._today = now.strftime("%Y-%m-%d")
+        if data.is_trading_day(self._today):
+            for tid in self.accounts():
+                with store.as_tenant(tid):
+                    try:
+                        self._account_tick(now.time(), self._today)
+                    except Exception:
+                        self._note("调度出错：" + traceback.format_exc().splitlines()[-1])
+        self._save()
+
+    def _account_tick(self, t: dt.time, today: str) -> None:
+        tid = store.tenant()
+        if dt.time(9, 15) <= t < dt.time(14, 40) and not self._done("morning"):
+            self._run("morning", morning_call, "报平安")
+        in_session = dt.time(9, 30) <= t < dt.time(11, 30) or dt.time(13, 0) <= t < dt.time(15, 0)
+        if in_session and time.time() - self.last_monitor.get(tid, 0) >= self.MONITOR_EVERY:
+            self.last_monitor[tid] = time.time()
+            try:
+                if n := monitor_intraday():
+                    self._note(f"盘中监控：{n} 条新情况")
+            except Exception:
+                self._note("盘中监控出错：" + traceback.format_exc().splitlines()[-1])
+        if t >= self.DIGEST_AT and not self._done("digest"):
+            if t < dt.time(13, 0):  # 午休时先补看最后几分钟，11:25 之后的情况也算进上午
                 try:
-                    if n := monitor_intraday():
-                        self._note(f"盘中监控：{n} 条新情况")
+                    monitor_intraday()
                 except Exception:
                     self._note("盘中监控出错：" + traceback.format_exc().splitlines()[-1])
-            if t >= dt.time(13, 0) and (today, "digest") not in self.done:
-                self._run("digest", flush_morning_digest, "上午汇总")
-            if dt.time(14, 40) <= t < dt.time(14, 57):
-                if (today, "intraday") not in self.done:
-                    self._run("intraday", check_intraday, "14:40 观察日检查", final=t >= self.INTRADAY_FINAL)
-                    self.last_nag = time.time()  # 刚发过清仓信号，不紧接着再催
-                elif time.time() - self.last_nag >= self.NAG_EVERY:
-                    self.last_nag = time.time()
-                    if nag_pending():
-                        self._note("催卖提醒")
-            if t >= dt.time(15, 30) and (today, "close") not in self.done:
-                self._run("close", check_close, "收盘检查", final=t >= self.CLOSE_FINAL)
-                if (today, "close") in self.done and _is_month_end():
-                    push(f"{today[:7]} 纪律报告", build_report(), "warn")
-            if (today, "close") in self.done and (today, "briefing") not in self.done:
-                self._run("briefing", daily_briefing, "收盘简报", final=t >= self.CLOSE_FINAL)
-        self._save()
+            self._run("digest", flush_morning_digest, "上午汇总")
+        if dt.time(14, 40) <= t < dt.time(14, 57):
+            if not self._done("intraday"):
+                self._run("intraday", check_intraday, "14:40 观察日检查", final=t >= self.INTRADAY_FINAL)
+                self.last_nag[tid] = time.time()  # 刚发过清仓信号，不紧接着再催
+            elif time.time() - self.last_nag.get(tid, 0) >= self.NAG_EVERY:
+                self.last_nag[tid] = time.time()
+                if nag_pending():
+                    self._note("催卖提醒")
+        if t >= dt.time(15, 30) and not self._done("close"):
+            self._run("close", check_close, "收盘检查", final=t >= self.CLOSE_FINAL)
+        if self._done("close") and not self._done("briefing"):
+            self._run("briefing", daily_briefing, "收盘简报", final=t >= self.CLOSE_FINAL)
+        # 月报是独立任务、有自己的完成标记：收盘检查是重启前做完的、或者手动补做的，月报照样会发
+        if self._done("close") and not self._done("report") and _is_month_end():
+            self._run("report", monthly_report, "月度纪律报告")
 
     def loop(self) -> None:
         self._note("已启动")

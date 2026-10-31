@@ -71,10 +71,7 @@ def test_recovery_needs_support_and_vwap():
 
 @pytest.fixture
 def env(tmp_path, monkeypatch):
-    monkeypatch.setattr(store, "DIR", tmp_path)
-    monkeypatch.setattr(store, "STATE", tmp_path / "state.json")
-    monkeypatch.setattr(store, "EVENTS", tmp_path / "events.jsonl")
-    monkeypatch.setattr(store, "SEAL", tmp_path / ".seal")
+    monkeypatch.setattr(store, "ROOT", tmp_path)
     pushes = []
     monkeypatch.setattr(core, "push", lambda t, b, level="info": pushes.append((t, level)))
     clock = {"today": "2026-10-23"}
@@ -86,7 +83,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(data, "today_minutes", lambda code: feed["minutes"])
     feed["factor"] = 1.0
     monkeypatch.setattr(data, "exright_factor", lambda code, since: feed["factor"])
-    monkeypatch.setattr(data, "sync_clock", lambda: 0.0)
+    monkeypatch.setattr(data, "clock_skew", lambda: 0.0)
+    monkeypatch.setattr(data, "_clock_offset", 0.0)
+    monkeypatch.setattr(data, "top10_holders", lambda code: {"date": "2026-06-30", "total": 60.0,
+                                                             "top1_name": "某集团", "top1_pct": 40.0, "complete": True})
     store.save({"holdings": {"600000": {"code": "600000", "name": "测试", "support": 10.0,
                                          "level": "小支撑", "added": "2026-10-01", "status": store.NORMAL}}})
     return clock, feed, pushes
@@ -164,7 +164,7 @@ def test_support_cannot_move_down(env):
 
 
 def test_hand_edited_state_is_flagged(env):
-    store.STATE.write_text(store.STATE.read_text().replace("10.0", "8.0"))
+    (store.dir() / "state.json").write_text((store.dir() / "state.json").read_text().replace("10.0", "8.0"))
     core._load()
     assert [e for e in store.events() if e["kind"] == "违规"]
     assert store.load()[1] is False  # 记录后重新封存
@@ -571,7 +571,7 @@ def test_severe_events_pushed_immediately_and_afternoon_minor_too(env, monkeypat
     pushes = _intraday_env(env, monkeypatch, (13, 30), 9.9, prev=10.0)  # 下午的一般情况直接发
     s, _ = store.load(); s["holdings"]["600000"]["support"] = 10.0; store.save(s)
     import json as _json
-    store.DIR.joinpath("intraday.json").unlink()
+    store.dir().joinpath("intraday.json").unlink()
     pushes.clear()
     core.monitor_intraday()
     assert ("🟡 盘中提醒 测试(600000)", "warn") in pushes
@@ -597,5 +597,469 @@ def test_scheduler_monitors_in_session_only_and_sends_digest(env, monkeypatch):
     s = core.Scheduler(); s.MONITOR_EVERY = 0
     s.tick(); assert calls == []                    # 9:25 还没开盘
     t["now"] = dt.datetime(2026, 10, 23, 10, 0); s.tick(); assert calls == ["monitor"]
-    t["now"] = dt.datetime(2026, 10, 23, 12, 10); s.tick(); assert calls == ["monitor"]  # 午休
-    t["now"] = dt.datetime(2026, 10, 23, 13, 0); s.tick(); assert calls == ["monitor", "monitor", "digest"]
+    t["now"] = dt.datetime(2026, 10, 23, 12, 10); s.tick(); assert calls == ["monitor", "monitor", "digest"]  # 午休：补看一轮后发上午汇总
+    t["now"] = dt.datetime(2026, 10, 23, 12, 40); s.tick(); assert calls == ["monitor", "monitor", "digest"]  # 汇总只发一次
+    t["now"] = dt.datetime(2026, 10, 23, 13, 0); s.tick(); assert calls == ["monitor", "monitor", "digest", "monitor"]
+
+
+# ---------- 收盘后日K未更新：用分钟线补今天 ----------
+
+def _raw_minutes(day, last="15:00"):
+    return pd.DataFrame({"day": [f"{day} 09:31:00", f"{day} 14:00:00", f"{day} {last}:00"],
+                         "open": ["10.0", "10.4", "10.2"], "high": ["10.5", "10.6", "10.2"],
+                         "low": ["9.9", "10.3", "10.2"], "close": ["10.1", "10.5", "10.2"],
+                         "volume": ["100", "200", "300"], "amount": ["1010", "2100", "3060"]})
+
+
+def test_today_bar_synthesized_after_close(monkeypatch):
+    import datetime as dt
+    monkeypatch.setattr(data, "today", lambda: "2026-10-26")
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 26, 15, 31, tzinfo=data.TZ))
+    monkeypatch.setattr(data.ak, "stock_zh_a_minute", lambda **kw: _raw_minutes("2026-10-26"))
+    old = daily_on("2026-10-23", [9.0] * 6)
+    df = data._with_today_bar(old, "sh600000")
+    assert df["date"].iloc[-1] == "2026-10-26"
+    assert df.iloc[-1][["open", "high", "low", "close", "volume"]].tolist() == [10.0, 10.6, 9.9, 10.2, 600.0]
+
+
+def test_no_synthetic_bar_during_session_or_incomplete_day(monkeypatch):
+    import datetime as dt
+    monkeypatch.setattr(data, "today", lambda: "2026-10-26")
+    monkeypatch.setattr(data.ak, "stock_zh_a_minute", lambda **kw: _raw_minutes("2026-10-26", last="14:30"))
+    old = daily_on("2026-10-23", [9.0] * 6)
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 26, 14, 30, tzinfo=data.TZ))
+    assert len(data._with_today_bar(old, "sh600000")) == len(old)      # 盘中不合成
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 26, 15, 31, tzinfo=data.TZ))
+    assert len(data._with_today_bar(old, "sh600000")) == len(old)      # 分钟线不到 15:00 也不合成
+
+
+def test_briefing_flags_stale_index_instead_of_mislabeling(env, monkeypatch):
+    clock, feed, pushes = env
+    clock["today"] = "2026-10-26"
+    feed["daily"] = daily_on("2026-10-26", [10.5] * 300)
+    monkeypatch.setattr(data, "financial_abstract", lambda code: None)
+    monkeypatch.setattr(data, "index_bars", lambda symbol="sh000300": pd.DataFrame(
+        {"date": ["2026-10-22", "2026-10-23"], "close": [4000.0, 4040.0]}))
+    core.daily_briefing()
+    text = core.last_briefing()["text"]
+    assert text.startswith("📊 2026-10-26 收盘简报")
+    assert "这是 2026-10-23 的数据，2026-10-26 的还没更新" in text
+
+
+def test_requests_without_timeout_do_not_hang_forever(monkeypatch):
+    # 10-27：同花顺接口接受连接却不回数据，akshare 不带超时的请求把调度线程卡死
+    import socket
+    import time
+    import requests
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    monkeypatch.setattr(data, "REQUEST_TIMEOUT", 1)
+    t0 = time.time()
+    with pytest.raises(requests.exceptions.Timeout):
+        requests.get(f"http://127.0.0.1:{srv.getsockname()[1]}/")
+    assert time.time() - t0 < 5
+    srv.close()
+
+
+# ---------- 买前体检 ----------
+import checkup  # noqa: E402
+
+
+def fin_full(last, ly, name_period=("2026-06-30", "2025-06-30"), annual_cfo=(1.0, 1.0)):
+    """last / ly: 字段字典（不带 % 的数值），生成同花顺格式的财务摘要。"""
+    base = {"净利润": "10亿", "净利润同比增长率": "10%", "扣非净利润同比增长率": "10%", "营业总收入同比增长率": "10%",
+            "基本每股收益": "1.0", "每股经营现金流": "1.5", "净资产收益率": "10%", "资产负债率": "50%",
+            "流动比率": "1.5", "销售毛利率": "30%", "存货周转率": "3.0", "销售净利率": "10%"}
+    rows = [{**base, "报告期": "2024-12-31", "每股经营现金流": str(annual_cfo[0])},
+            {**base, "报告期": "2025-12-31", "每股经营现金流": str(annual_cfo[1])}]
+    rows.append({**base, **ly, "报告期": name_period[1]})
+    rows.append({**base, **last, "报告期": name_period[0]})
+    return pd.DataFrame(rows).sort_values("报告期")
+
+
+HOLDERS_OK = {"date": "2026-06-30", "total": 60.0, "top1_name": "某集团", "top1_pct": 40.0, "complete": True}
+
+
+def flat_bars(n=300, price=10.0):
+    return bars([price] * n)
+
+
+def plat(support):
+    return rules.Platform("2026-09-01", "2026-09-20", 14, support, support * 1.08, support * 0.99)
+
+
+def test_amount_parsing():
+    assert checkup.amount("439.45亿") == 439.45e8 and checkup.amount("-867.31万") == -8673100
+    assert checkup.amount("--") is None
+
+
+def test_healthy_company_worth_considering():
+    good = {"净资产收益率": "12%", "资产负债率": "45%", "流动比率": "1.6", "销售毛利率": "32%", "存货周转率": "3.2"}
+    c = checkup.evaluate("600000", "好公司", fin_full(good, {}), flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert c.verdict == checkup.VERDICT_GOOD and not c.vetoes and c.pass_rate >= 0.67
+
+
+def test_hard_flaws_block():
+    loss = checkup.evaluate("600000", "亏损股", fin_full({"净利润": "-5.37亿"}, {}), flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert loss.verdict == checkup.VERDICT_NO and "亏损" in loss.vetoes[0]
+    st = checkup.evaluate("600000", "*ST某某", fin_full({}, {}), flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert st.verdict == checkup.VERDICT_NO
+    debt = checkup.evaluate("600000", "高负债", fin_full({"资产负债率": "85%"}, {}), flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert any("资产负债率" in v for v in debt.vetoes)
+    cash = checkup.evaluate("600000", "烧钱", fin_full({}, {}, annual_cfo=(-0.5, -0.2)), flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert any("经营现金流" in v for v in cash.vetoes)
+    nodata = checkup.evaluate("600000", "某某", None, flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert nodata.verdict == checkup.VERDICT_NO
+
+
+def test_bank_skips_industrial_ratios_and_high_debt_not_vetoed():
+    f = fin_full({"资产负债率": "92%"}, {}).drop(columns=["销售毛利率", "存货周转率", "流动比率"])
+    c = checkup.evaluate("601398", "某银行", f, flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    names = [s.name for s in c.signals]
+    assert not c.vetoes and "毛利率改善" not in names and "净利率改善" in names
+
+
+def test_growth_company_not_hard_blocked_by_fscore_alone():
+    # 高增长但毛利率、周转、负债都变差（宁德时代那种）：谨慎，不硬拦
+    worse = {"资产负债率": "60%", "流动比率": "1.2", "销售毛利率": "25%", "存货周转率": "2.5", "净资产收益率": "9%",
+             "每股经营现金流": "0.9", "营业总收入同比增长率": "56%", "扣非净利润同比增长率": "32%"}
+    c = checkup.evaluate("300750", "增长股", fin_full(worse, {}), flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert c.verdict == checkup.VERDICT_CAUTION and c.cautions[0].startswith("财务体检一般")
+
+
+def test_valuation_and_stop_room_cautions():
+    pe = pd.DataFrame({"date": [str(i) for i in range(100)], "value": [10.0 + i * 0.1 for i in range(100)]})
+    c = checkup.evaluate("600000", "贵", fin_full({}, {}), flat_bars(), [plat(9.6)], pe, None, HOLDERS_OK)
+    assert any("估值偏高" in x for x in c.cautions)
+    far = checkup.evaluate("600000", "远", fin_full({}, {}), flat_bars(), [plat(8.0)], None, None, HOLDERS_OK)
+    assert any("止损空间太大" in x for x in far.cautions)
+    none = checkup.evaluate("600000", "无", fin_full({}, {}), flat_bars(), [], None, None, HOLDERS_OK)
+    assert any("没有横盘平台" in x for x in none.cautions)
+
+
+def test_add_holding_blocked_when_not_recommended_unless_existing(env, monkeypatch):
+    clock, feed, pushes = env
+    feed["daily"] = daily_on("2026-10-23", [10.2] * 300)
+    monkeypatch.setattr(data, "stock_name", lambda code: "亏损股")
+    monkeypatch.setattr(data, "financial_abstract", lambda code: fin_full({"净利润": "-1亿"}, {}))
+    monkeypatch.setattr(data, "valuation", lambda code, ind: None)
+    with pytest.raises(core.Refused, match="拦截"):
+        core.add_holding("600111", 9.8)
+    assert "600111" not in store.load()[0]["holdings"]
+    assert [e for e in store.events() if e["kind"] == "拦截建仓"]
+    core.add_holding("600111", 9.8, existing=True)  # 补录已有持仓：不拦，但记录
+    h = store.load()[0]["holdings"]["600111"]
+    assert h["checkup"]["verdict"] == "不建议"
+    assert [e for e in store.events() if e["kind"] == "补录不建议"]
+
+
+def test_checkup_cached_per_day(env, monkeypatch):
+    clock, feed, pushes = env
+    feed["daily"] = daily_on("2026-10-23", [10.2] * 300)
+    calls = []
+    monkeypatch.setattr(data, "stock_name", lambda code: "好公司")
+    monkeypatch.setattr(data, "financial_abstract", lambda code: calls.append(1) or fin_full({}, {}))
+    monkeypatch.setattr(data, "valuation", lambda code, ind: None)
+    core.pre_buy_checkup("600222"); core.pre_buy_checkup("600222")
+    assert len(calls) == 1
+    clock["today"] = "2026-10-26"
+    core.pre_buy_checkup("600222")
+    assert len(calls) == 2
+
+
+
+def test_top10_concentration_rule():
+    f = fin_full({}, {})
+    ok = checkup.evaluate("600000", "集中", f, flat_bars(), [plat(9.6)], None, None, HOLDERS_OK)
+    assert not ok.vetoes and any("前十大股东合计 60.0%" in n for n in ok.notes)
+    low = {**HOLDERS_OK, "total": 48.0}
+    c = checkup.evaluate("600615", "分散", f, flat_bars(), [plat(9.6)], None, None, low)
+    assert c.verdict == checkup.VERDICT_NO and "股权太分散" in c.vetoes[0]
+    edge = checkup.evaluate("600000", "刚好", f, flat_bars(), [plat(9.6)], None, None, {**HOLDERS_OK, "total": 51.0})
+    assert not edge.vetoes
+    gone = checkup.evaluate("600000", "没数据", f, flat_bars(), [plat(9.6)], None, None, None)
+    assert gone.verdict == checkup.VERDICT_NO and "拿不到" in gone.vetoes[0]
+    partial = checkup.evaluate("600000", "不全", f, flat_bars(), [plat(9.6)], None, None,
+                               {**HOLDERS_OK, "total": 45.0, "complete": False})
+    assert "数据不全" in partial.vetoes[0]
+    partial_ok = checkup.evaluate("600000", "不全但够", f, flat_bars(), [plat(9.6)], None, None,
+                                  {**HOLDERS_OK, "total": 66.0, "complete": False})
+    assert not partial_ok.vetoes  # 能拿到的部分已经超过 51%，缺的只会更多
+
+
+# ---------- 分控台 ----------
+import base64  # noqa: E402
+
+import tenants  # noqa: E402
+
+
+@pytest.fixture
+def multi(env, monkeypatch, tmp_path):
+    """主控台密码 main-pass，外加一个分控台。返回 (client, friend, 登录头函数)。"""
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({"password": "main-pass", "pushplus_token": "MAIN-TOKEN"}))
+    monkeypatch.setattr(app.notify, "CONFIG", cfg)
+    monkeypatch.setattr(app.time, "sleep", lambda s: None)
+    monkeypatch.setattr(app, "guard", app.RateGuard())
+    friend = tenants.create("老王")
+
+    def auth(user, pw):
+        return {"Authorization": "Basic " + base64.b64encode(f"{user}:{pw}".encode()).decode()}
+    return app.app.test_client(), friend, auth
+
+
+import json  # noqa: E402
+
+
+def test_friend_data_is_isolated(multi, env):
+    c, friend, auth = multi
+    clock, feed, pushes = env
+    fa = auth(friend["id"], friend["password"])
+    st = c.get("/api/state", headers=fa).get_json()
+    assert st["role"] == "friend" and st["account"] == "老王" and st["holdings"] == []  # 看不到主控台的 600000
+    with store.as_tenant(friend["id"]):
+        store.save({"holdings": {"000333": {"code": "000333", "name": "美的", "support": 80.0, "level": "手动",
+                                             "added": "2026-10-23", "status": store.NORMAL}}})
+    main_st = c.get("/api/state", headers=auth("x", "main-pass")).get_json()
+    assert [h["code"] for h in main_st["holdings"]] == ["600000"]               # 主控台也看不到朋友的
+    assert [h["code"] for h in c.get("/api/state", headers=fa).get_json()["holdings"]] == ["000333"]
+    # 朋友不能碰管理功能，也不能操作别人的票
+    assert c.get("/api/admin/tenants", headers=fa).status_code == 403
+    assert c.post("/api/sold", json={"code": "600000", "price": 1}, headers=fa).status_code == 400
+    assert "600000" in store.load()[0]["holdings"]
+
+
+def test_admin_overview_has_no_holding_details(multi):
+    c, friend, auth = multi
+    with store.as_tenant(friend["id"]):
+        store.save({"holdings": {"000333": {"code": "000333", "name": "美的", "support": 80.0}}})
+    ov = c.get("/api/admin/tenants", headers=auth("x", "main-pass")).get_json()["tenants"][0]
+    assert ov["holdings"] == 1 and "000333" not in json.dumps(ov) and "美的" not in json.dumps(ov)
+
+
+def test_revoke_and_restore_access(multi):
+    c, friend, auth = multi
+    fa, ma = auth(friend["id"], friend["password"]), auth("x", "main-pass")
+    assert c.get("/api/state", headers=fa).status_code == 200
+    c.post(f"/api/admin/tenants/{friend['id']}/disable", headers=ma)
+    assert c.get("/api/state", headers=fa).status_code == 401                    # 立刻进不来
+    assert friend["id"] not in tenants.active_ids()                              # 定时任务也不替他跑
+    c.post(f"/api/admin/tenants/{friend['id']}/enable", headers=ma)
+    assert c.get("/api/state", headers=fa).status_code == 200
+    new_pw = c.post(f"/api/admin/tenants/{friend['id']}/reset", headers=ma).get_json()["password"]
+    assert c.get("/api/state", headers=fa).status_code == 401
+    assert c.get("/api/state", headers=auth(friend["id"], new_pw)).status_code == 200
+    with store.as_tenant(friend["id"]):
+        store.log("建仓", "000333")
+    c.post(f"/api/admin/tenants/{friend['id']}/delete", headers=ma)
+    assert not (store.ROOT / "tenants" / friend["id"]).exists()
+    assert c.get("/api/state", headers=auth(friend["id"], new_pw)).status_code == 401
+
+
+def test_passwords_stored_hashed_only(multi):
+    c, friend, auth = multi
+    assert friend["password"] not in (store.ROOT / "tenants.json").read_text()
+    assert not tenants.verify(friend["id"], "wrong") and tenants.verify(friend["id"], friend["password"])
+
+
+def test_friend_alerts_go_to_friend_wechat_only(multi, monkeypatch):
+    c, friend, auth = multi
+    sent = []
+    monkeypatch.setattr(app.notify.requests, "post", lambda url, **kw: sent.append(kw["json"]["token"]))
+    fa = auth(friend["id"], friend["password"])
+    c.post("/api/test-alert", headers=fa)
+    assert sent == []                                                            # 朋友还没填 token：谁都不发
+    c.post("/api/settings", json={"pushplus_token": "FRIEND-TOKEN"}, headers=fa)
+    c.post("/api/test-alert", headers=fa)
+    assert sent == ["FRIEND-TOKEN"]
+    c.post("/api/test-alert", headers=auth("x", "main-pass"))
+    assert sent == ["FRIEND-TOKEN", "MAIN-TOKEN"]
+    # 提醒记录也分开
+    assert len(c.get("/api/state", headers=fa).get_json()["alerts"]) == 2
+
+
+def test_feedback_reaches_admin(multi, monkeypatch):
+    c, friend, auth = multi
+    sent = []
+    monkeypatch.setattr(app.notify.requests, "post", lambda url, **kw: sent.append(kw["json"]))
+    fa = auth(friend["id"], friend["password"])
+    assert c.post("/api/feedback", json={"text": "回补区 3% 有点窄"}, headers=fa).get_json()["ok"]
+    fb = c.get("/api/admin/tenants", headers=auth("x", "main-pass")).get_json()["feedback"]
+    assert fb[0]["name"] == "老王" and fb[0]["text"] == "回补区 3% 有点窄"
+    assert sent[0]["token"] == "MAIN-TOKEN" and "老王" in sent[0]["title"]
+
+
+def test_rate_guard_rules():
+    g = app.RateGuard()
+    t = 1000.0
+    for i in range(15):
+        assert g.check("f1", f"sig{i}", t + i) is None                         # 1 分钟 15 次不同操作：放行
+    assert "1 分钟内操作了 16 次" in g.check("f1", "sig15", t + 15)
+    assert "暂停" in g.check("f1", "sig16", t + 30)                              # 冷却期内全拦
+    assert g.check("f1", "sigX", t + 15 + 121) is None                          # 2 分钟后恢复
+    g2 = app.RateGuard()
+    for i in range(5):
+        assert g2.check("f2", "same", t + i * 5) is None
+    assert "同一个操作" in g2.check("f2", "same", t + 30)                        # 同一个操作重复 6 次
+    assert g2.check("f3", "same", t + 30) is None                               # 各分控台互不影响
+
+
+def test_rate_limit_popup_and_admin_notified_once(multi, monkeypatch):
+    c, friend, auth = multi
+    sent = []
+    monkeypatch.setattr(app.notify.requests, "post", lambda url, **kw: sent.append(kw["json"]["title"]))
+    fa = auth(friend["id"], friend["password"])
+    codes = [c.post("/api/feedback", json={"text": f"刷{i}"}, headers=fa).status_code for i in range(20)]
+    assert 429 in codes
+    r = c.post("/api/feedback", json={"text": "再来"}, headers=fa)
+    assert r.status_code == 429 and r.get_json()["rate_limited"]
+    assert sum("操作异常频繁" in t for t in sent) == 1                             # 主控台只收到一次
+    assert tenants.overview()[0]["rate_limited"] >= 1
+    ma = auth("x", "main-pass")
+    assert all(c.post("/api/test-alert", headers=ma).status_code == 200 for _ in range(20))  # 主控台不限
+
+
+def test_scheduler_runs_each_active_account(multi, monkeypatch):
+    import datetime as dt
+    c, friend, auth = multi
+    other = tenants.create("老李")
+    tenants.set_enabled(other["id"], False)
+    ran = []
+    monkeypatch.setattr(core, "morning_call", lambda: ran.append(store.tenant()))
+    monkeypatch.setattr(core, "monitor_intraday", lambda: 0)
+    monkeypatch.setattr(data, "is_trading_day", lambda d=None: True)
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 23, 9, 20))
+    s = core.Scheduler()
+    s.tick(); s.tick()
+    assert ran == [store.MAIN, friend["id"]]                                    # 停用的老李不跑，各跑一次
+    assert ("2026-10-23", "morning") in s.done and ("2026-10-23", f"{friend['id']}|morning") in s.done
+
+
+def test_outage_violation_only_for_main_when_manually_stopped(multi, monkeypatch):
+    import datetime as dt
+    c, friend, auth = multi
+    t = {"now": dt.datetime(2026, 10, 26, 14, 0)}
+    monkeypatch.setattr(data, "now", lambda: t["now"])
+    core.Scheduler().mark_stopped()
+    t["now"] = dt.datetime(2026, 10, 26, 18, 0)
+    core.Scheduler().check_downtime()
+    assert [e["kind"] for e in store.events() if e["kind"] in ("违规", "故障")] == ["违规"]
+    with store.as_tenant(friend["id"]):
+        assert [e["kind"] for e in store.events()] == ["故障"]                  # 朋友关不了服务器，不算他违规
+
+
+def test_pushplus_prompt_ack_persists_and_keeps_token(multi):
+    c, friend, auth = multi
+    fa = auth(friend["id"], friend["password"])
+    st = c.get("/api/state", headers=fa).get_json()
+    assert st["pushplus_ack"] is False and st["has_token"] is False          # 新分控台：要弹
+    c.post("/api/settings", json={"pushplus_token": "FRIEND-TOKEN"}, headers=fa)
+    c.post("/api/settings", json={"pushplus_ack": True}, headers=fa)         # 只点"已开通"
+    st = c.get("/api/state", headers=fa).get_json()
+    assert st["pushplus_ack"] is True and st["has_token"] is True             # token 没被清掉
+    assert c.get("/api/state", headers=auth("x", "main-pass")).get_json()["pushplus_ack"] is True  # 主控台永不弹
+
+
+
+# ---------- 2026-10-28 的事故：唤醒瞬间时钟没校准 ----------
+
+def test_stale_clock_after_wake_skips_tick_until_calibrated(env, monkeypatch):
+    import datetime as dt
+    calls = []
+    monkeypatch.setattr(core, "check_close", lambda final=True: calls.append(("close", final)) or 0)
+    monkeypatch.setattr(core, "daily_briefing", lambda final=True: calls.append(("briefing", final)) or 0)
+    monkeypatch.setattr(core, "morning_call", lambda: None)
+    monkeypatch.setattr(core, "monitor_intraday", lambda: 0)
+    monkeypatch.setattr(core, "_is_month_end", lambda: False)
+    monkeypatch.setattr(data, "is_trading_day", lambda d=None: True)
+    # 系统时钟停在昨晚 23:50，真实时间是今天 01:34（网络时间快 1 小时 44 分）
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 27, 23, 50, tzinfo=data.TZ))
+    monkeypatch.setattr(data, "clock_skew", lambda: 6240.0)
+    s = core.Scheduler()
+    s.tick(); s.tick()
+    assert calls == [] and not s.done                                          # 时钟不可信：什么都不跑、什么都不标记
+    # 平台把时钟校准好了：今天 01:34，离收盘还早
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 28, 1, 34, tzinfo=data.TZ))
+    monkeypatch.setattr(data, "clock_skew", lambda: 0.3)
+    s.tick()
+    assert calls == [] and ("2026-10-28", "close") not in s.done               # 15:30 的收盘检查没有被提前"做掉"
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 28, 15, 30, tzinfo=data.TZ))
+    s.tick(); s.tick()
+    assert calls == [("close", False), ("briefing", False)]
+
+
+def test_persistently_wrong_clock_falls_back_to_network_time(monkeypatch):
+    monkeypatch.setattr(data, "_clock_offset", 0.0)
+    monkeypatch.setattr(data, "clock_skew", lambda: 3600.0)
+    s = core.Scheduler()
+    assert not s._clock_ok() and not s._clock_ok()                             # 先等平台校准
+    assert s._clock_ok() and data._clock_offset == 3600                         # 第 3 次还不准：改用网络时间
+    monkeypatch.setattr(data, "clock_skew", lambda: 0.0)                        # 后来系统时钟被修好了
+    assert not s._clock_ok() and not s._clock_ok() and s._clock_ok()
+    assert data._clock_offset == 0                                              # 校正自动撤掉，不会双重校正
+
+
+def test_manual_close_check_refused_before_close(multi, monkeypatch):
+    import datetime as dt
+    c, friend, auth = multi
+    monkeypatch.setattr(data, "is_trading_day", lambda d=None: True)
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 28, 1, 34, tzinfo=data.TZ))
+    r = c.post("/api/run/close", headers=auth("x", "main-pass"))
+    assert r.status_code == 400 and "还没收盘" in r.get_json()["error"]
+
+
+def test_no_morning_or_briefing_push_without_holdings(env, monkeypatch):
+    clock, feed, pushes = env
+    store.save({"holdings": {}})
+    monkeypatch.setattr(data, "index_bars", lambda symbol="sh000300": pd.DataFrame({"date": ["2026-10-23"], "close": [1.0]}))
+    pushes.clear()
+    core.morning_call(); core.daily_briefing()
+    assert pushes == []
+
+
+
+def test_monthly_report_sent_once_on_last_trading_day(env, monkeypatch):
+    import datetime as dt
+    clock, feed, pushes = env
+    cal = ["2026-10-29", "2026-10-30", "2026-11-02"]
+    monkeypatch.setattr(data, "trading_days", lambda: cal)
+    monkeypatch.setattr(data, "is_trading_day", lambda d=None: True)
+    monkeypatch.setattr(core, "check_close", lambda final=True: 0)
+    monkeypatch.setattr(core, "daily_briefing", lambda final=True: 0)
+    monkeypatch.setattr(core, "morning_call", lambda: None)
+    monkeypatch.setattr(core, "monitor_intraday", lambda: 0)
+    monkeypatch.setattr(data, "daily_bars", lambda code, days=200: daily_on("2026-10-30", [10.0] * 6))
+    t = {"now": dt.datetime(2026, 10, 29, 15, 31, tzinfo=data.TZ)}
+    monkeypatch.setattr(data, "now", lambda: t["now"])
+    clock["today"] = "2026-10-29"
+    s = core.Scheduler()
+    s.tick(); s.tick()
+    assert not any("纪律报告" in p[0] for p in pushes)                          # 10-29 不是月末
+    clock["today"] = "2026-10-30"
+    t["now"] = dt.datetime(2026, 10, 30, 15, 31, tzinfo=data.TZ)
+    s.tick(); s.tick(); s.tick()
+    assert [p for p in pushes if "纪律报告" in p[0]] == [("📋 2026-10 纪律报告", "warn")]  # 发且只发一次
+
+
+def test_monthly_report_still_sent_if_close_done_before_restart(env, monkeypatch):
+    import datetime as dt
+    clock, feed, pushes = env
+    monkeypatch.setattr(data, "trading_days", lambda: ["2026-10-30", "2026-11-02"])
+    monkeypatch.setattr(data, "is_trading_day", lambda d=None: True)
+    monkeypatch.setattr(core, "daily_briefing", lambda final=True: 0)
+    monkeypatch.setattr(data, "daily_bars", lambda code, days=200: daily_on("2026-10-30", [10.0] * 6))
+    monkeypatch.setattr(data, "now", lambda: dt.datetime(2026, 10, 30, 16, 0, tzinfo=data.TZ))
+    clock["today"] = "2026-10-30"
+    s = core.Scheduler()
+    s.done |= {("2026-10-30", "close"), ("2026-10-30", "briefing")}           # 重启前收盘检查已做完
+    s.tick()
+    assert ("📋 2026-10 纪律报告", "warn") in pushes
+
+
+def test_no_monthly_report_for_empty_account(env):
+    clock, feed, pushes = env
+    store.save({"holdings": {}})
+    pushes.clear()
+    core.monthly_report()
+    assert pushes == []

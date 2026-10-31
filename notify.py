@@ -1,4 +1,5 @@
-"""提醒：Mac 系统弹窗/语音 + 微信推送（config.json 里填 pushplus_token 或 serverchan_key）。
+"""提醒：Mac 系统弹窗/语音 + 微信推送。按账号隔离：主控台用 config.json 的 token，
+分控台用自己在面板里填的 token（tenants/<账号>/settings.json），提醒永远只发给当前账号自己。
 
 level:
   info      普通通知
@@ -12,10 +13,17 @@ from pathlib import Path
 
 import requests
 
+import store
+import tenants
+
 CONFIG = Path(__file__).parent / "config.json"
 
-# App 页面轮询这个列表来显示最近的提醒
-recent: list[dict] = []
+# 页面轮询这个来显示最近的提醒，按账号分开
+_recent: dict[str, list[dict]] = {}
+
+
+def recent() -> list[dict]:
+    return _recent.get(store.tenant(), [])
 
 
 def _config() -> dict:
@@ -45,7 +53,10 @@ def _mac(title: str, body: str, level: str) -> None:
 
 
 def _wechat(title: str, body: str) -> None:
-    cfg = _config()
+    if store.tenant() == store.MAIN:
+        cfg = _config()
+    else:
+        cfg = tenants.settings(store.tenant())
     try:
         if cfg.get("pushplus_token"):
             requests.post("https://www.pushplus.plus/send", timeout=10, json={
@@ -61,7 +72,9 @@ def _wechat(title: str, body: str) -> None:
 def push(title: str, body: str, level: str = "info") -> None:
     from data import now
     print(f"\n==== {title} ====\n{body}\n")
-    recent.insert(0, {"time": f"{now():%m-%d %H:%M:%S}", "title": title, "body": body, "level": level})
-    del recent[50:]
-    _mac(title, body, level)
+    items = _recent.setdefault(store.tenant(), [])
+    items.insert(0, {"time": f"{now():%m-%d %H:%M:%S}", "title": title, "body": body, "level": level})
+    del items[50:]
+    if store.tenant() == store.MAIN:
+        _mac(title, body, level)  # Mac 弹窗只给本机主人
     _wechat(title, body)

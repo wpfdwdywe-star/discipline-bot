@@ -2,7 +2,8 @@
 
 用法：
   python bot.py add 600519               建仓：自动找平台支撑位，选一个锁定
-  python bot.py add 600519 --support 12.5 建仓：手动指定支撑位
+  python bot.py add 600519 --support 12.5 建仓：手动指定支撑位（新买入必须过买前体检）
+  python bot.py checkup 600519            买前体检
   python bot.py raise 600519 13.2         上移支撑位（只能上移）
   python bot.py list                      查看持仓和状态
   python bot.py sold 600519 --price 12.3  报告已卖出
@@ -22,7 +23,7 @@ from store import SELL, WATCH
 
 def cmd_add(args) -> None:
     if args.support:
-        h = core.add_holding(args.code, args.support)
+        h = core.add_holding(args.code, args.support, existing=args.existing)
     else:
         c = core.candidate_platforms(args.code)
         if not c["platforms"]:
@@ -39,7 +40,8 @@ def cmd_add(args) -> None:
         print("锁定后只能上移，不能下移。收盘跌破 → 观察一天 → 14:40 没有收回就清仓。")
         if input("输入 yes 确认：").strip().lower() != "yes":
             raise Refused("取消。")
-        h = core.add_holding(args.code, p["support"], p["level"], f"{p['start']}~{p['end']}({p['days']}天)")
+        h = core.add_holding(args.code, p["support"], p["level"], f"{p['start']}~{p['end']}({p['days']}天)",
+                             existing=args.existing)
     print(f"已锁定 {h['name']}({h['code']}) 支撑位 {h['support']}")
 
 
@@ -57,6 +59,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description="交易纪律机器人")
     sub = p.add_subparsers(dest="cmd", required=True)
     a = sub.add_parser("add"); a.add_argument("code"); a.add_argument("--support", type=float)
+    a.add_argument("--existing", action="store_true", help="补录已经持有的票（体检不建议也不拦）")
+    c = sub.add_parser("checkup"); c.add_argument("code")
     r = sub.add_parser("raise"); r.add_argument("code"); r.add_argument("price", type=float)
     sub.add_parser("list")
     s = sub.add_parser("sold"); s.add_argument("code"); s.add_argument("--price", type=float)
@@ -72,6 +76,7 @@ def main() -> None:
                 h = core.raise_support(args.code, args.price)
                 print(f"{h['name']}({h['code']}) 支撑位上移到 {h['support']}")
             case "list": cmd_list(args)
+            case "checkup": print(core.pre_buy_checkup(args.code)["report"])
             case "sold": print(core.record_sold(args.code, args.price))
             case "close": core.check_close()
             case "intraday": core.check_intraday()
